@@ -1,0 +1,73 @@
+---
+- name: Ensure backbone keypair exists
+  ansible.builtin.shell: |
+    set -euo pipefail
+    umask 077
+    test -f {{ dromos_secrets_dir }}/backbone.key || {
+      wg genkey | tee {{ dromos_secrets_dir }}/backbone.key | wg pubkey > {{ dromos_secrets_dir }}/backbone.pub
+    }
+  args:
+    creates: "{{ dromos_secrets_dir }}/backbone.pub"
+
+- name: Slurp backbone private key
+  ansible.builtin.slurp:
+    src: "{{ dromos_secrets_dir }}/backbone.key"
+  register: _backbone_key
+
+- name: Set fact for backbone private key
+  ansible.builtin.set_fact:
+    dromos_backbone_peleon_private_key: "{{ _backbone_key.content | b64decode | trim }}"
+
+- name: Require Phebes backbone public key
+  ansible.builtin.fail:
+    msg: "dromos_phebes_backbone_public_key must be set in inventory or via -e"
+  when: dromos_phebes_backbone_public_key is not defined
+
+- name: Render backbone WG config (Peleon side)
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../templates/wireguard/dromos-backbone-peleon.conf.j2"
+    dest: /etc/wireguard/dromos-backbone.conf
+    owner: root
+    group: root
+    mode: "0600"
+  notify: reload dromos-backbone
+
+- name: Render Peleon nftables ruleset
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../templates/nftables/dromos.nft.j2"
+    dest: "{{ dromos_config_dir }}/dromos.nft"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: reload dromos-nft
+
+- name: Install dromos-nft systemd unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/dromos-nft.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Dromos nftables (isolated table inet dromos)
+      Before=wg-quick@dromos-backbone.service
+      After=network-pre.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=true
+      ExecStart=/usr/sbin/nft -f {{ dromos_config_dir }}/dromos.nft
+      ExecReload=/usr/sbin/nft -f {{ dromos_config_dir }}/dromos.nft
+      ExecStop=/usr/sbin/nft delete table inet dromos
+      [Install]
+      WantedBy=multi-user.target
+  notify: reload systemd
+
+- name: Enable Dromos services on Peleon
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop:
+    - dromos-nft.service
+    - wg-quick@dromos-backbone.service

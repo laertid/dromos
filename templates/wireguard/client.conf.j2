@@ -1,0 +1,15 @@
+{# Per-user client config. Hand this file (or a QR of it) to the user. #}
+[Interface]
+PrivateKey = {{ user.private_key }}
+Address    = {{ user.address }}/32
+DNS        = {{ dromos_client_dns | default('10.66.0.1') }}
+MTU        = {{ dromos_client_mtu | default(1380) }}
+
+[Peer]
+PublicKey  = {{ dromos_server_public_key }}
+{% if user.preshared_key is defined %}
+PresharedKey = {{ user.preshared_key }}
+{% endif %}
+Endpoint   = {{ dromos_phebes_endpoint }}:{{ dromos_client_listen_port | default(51820) }}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25

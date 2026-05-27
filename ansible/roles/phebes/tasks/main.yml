@@ -1,0 +1,160 @@
+---
+- name: Install Phebes-specific packages
+  ansible.builtin.apt:
+    name:
+      - shadowsocks-libev
+      - openvpn
+      - easy-rsa
+      - dnsmasq
+    state: present
+
+- name: Ensure server keypair exists
+  ansible.builtin.shell: |
+    set -euo pipefail
+    umask 077
+    test -f {{ dromos_secrets_dir }}/server.key || {
+      wg genkey | tee {{ dromos_secrets_dir }}/server.key | wg pubkey > {{ dromos_secrets_dir }}/server.pub
+    }
+    test -f {{ dromos_secrets_dir }}/backbone.key || {
+      wg genkey | tee {{ dromos_secrets_dir }}/backbone.key | wg pubkey > {{ dromos_secrets_dir }}/backbone.pub
+    }
+  args:
+    creates: "{{ dromos_secrets_dir }}/server.pub"
+
+- name: Slurp server private key
+  ansible.builtin.slurp:
+    src: "{{ dromos_secrets_dir }}/server.key"
+  register: _server_key
+
+- name: Slurp backbone private key
+  ansible.builtin.slurp:
+    src: "{{ dromos_secrets_dir }}/backbone.key"
+  register: _backbone_key
+
+- name: Set fact for server private key
+  ansible.builtin.set_fact:
+    dromos_server_private_key: "{{ _server_key.content | b64decode | trim }}"
+    dromos_backbone_phebes_private_key: "{{ _backbone_key.content | b64decode | trim }}"
+
+- name: Load existing user list
+  ansible.builtin.slurp:
+    src: "{{ dromos_config_dir }}/users.json"
+  register: _users_json
+  ignore_errors: true
+
+- name: Set fact for users
+  ansible.builtin.set_fact:
+    dromos_users: "{{ (_users_json.content | b64decode | from_json).users | default([]) if _users_json is succeeded else [] }}"
+
+- name: Render client-facing WireGuard config
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../templates/wireguard/dromos-client.conf.j2"
+    dest: /etc/wireguard/dromos-client.conf
+    owner: root
+    group: root
+    mode: "0600"
+  notify: reload dromos-client
+
+- name: Render backbone WireGuard config (Phebes side)
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../templates/wireguard/dromos-backbone-phebes.conf.j2"
+    dest: /etc/wireguard/dromos-backbone.conf
+    owner: root
+    group: root
+    mode: "0600"
+  notify: reload dromos-backbone
+
+- name: Render nftables ruleset
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../../templates/nftables/dromos.nft.j2"
+    dest: "{{ dromos_config_dir }}/dromos.nft"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: reload dromos-nft
+
+- name: Install dromos-nft systemd unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/dromos-nft.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Dromos nftables (isolated table inet dromos)
+      Before=wg-quick@dromos-client.service wg-quick@dromos-backbone.service
+      After=network-pre.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=true
+      ExecStart=/usr/sbin/nft -f {{ dromos_config_dir }}/dromos.nft
+      ExecReload=/usr/sbin/nft -f {{ dromos_config_dir }}/dromos.nft
+      ExecStop=/usr/sbin/nft delete table inet dromos
+      [Install]
+      WantedBy=multi-user.target
+  notify: reload systemd
+
+- name: Enable Dromos units
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop:
+    - dromos-nft.service
+    - wg-quick@dromos-backbone.service
+    - wg-quick@dromos-client.service
+
+- name: Install geo-update script + timer
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../scripts/dromos-geo-update"
+    dest: /usr/local/sbin/dromos-geo-update
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install dromos-user CLI
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../scripts/dromos-user"
+    dest: /usr/local/sbin/dromos-user
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install geo timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/dromos-geo-update.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Weekly Dromos geobase refresh
+      [Timer]
+      OnCalendar=Sun *-*-* 03:17:00
+      Persistent=true
+      RandomizedDelaySec=15m
+      [Install]
+      WantedBy=timers.target
+
+- name: Install geo update service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/dromos-geo-update.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Refresh Dromos RU geobase
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/dromos-geo-update
+
+- name: Enable geo timer
+  ansible.builtin.systemd:
+    name: dromos-geo-update.timer
+    enabled: true
+    state: started
+    daemon_reload: true

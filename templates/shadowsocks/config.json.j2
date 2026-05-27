@@ -1,0 +1,11 @@
+{
+  "server": ["0.0.0.0"],
+  "server_port": {{ dromos_ss_port | default(8388) }},
+  "password": "{{ dromos_ss_password }}",
+  "method": "{{ dromos_ss_method | default('chacha20-ietf-poly1305') }}",
+  "mode": "tcp_and_udp",
+  "fast_open": false,
+  "no_delay": true,
+  "timeout": 300,
+  "user": "{{ dromos_ss_user | default('dromos-ss') }}"
+}

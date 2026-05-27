@@ -1,0 +1,8 @@
+---
+- name: Configure Peleon (exit node, IT)
+  hosts: peleon
+  become: true
+  gather_facts: true
+  roles:
+    - common
+    - peleon

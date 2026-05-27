@@ -1,0 +1,39 @@
+{# OpenVPN TCP/443 fallback.  Looks enough like HTTPS to evade naive DPI. #}
+port 443
+proto tcp-server
+dev tun-dromos
+dev-type tun
+
+ca   /etc/dromos/secrets/openvpn/ca.crt
+cert /etc/dromos/secrets/openvpn/server.crt
+key  /etc/dromos/secrets/openvpn/server.key
+dh   /etc/dromos/secrets/openvpn/dh.pem
+tls-crypt /etc/dromos/secrets/openvpn/ta.key
+
+server 10.68.0.0 255.255.255.0
+topology subnet
+
+# We hand out the same DNS as WG users.
+push "dhcp-option DNS {{ dromos_client_dns | default('10.66.0.1') }}"
+push "redirect-gateway def1 bypass-dhcp"
+push "block-outside-dns"
+
+keepalive 10 60
+cipher AES-256-GCM
+auth   SHA256
+ncp-ciphers AES-256-GCM:AES-128-GCM
+tls-version-min 1.2
+remote-cert-tls client
+
+user  {{ dromos_ovpn_user | default('dromos-ovpn') }}
+group {{ dromos_ovpn_group | default('dromos-ovpn') }}
+persist-key
+persist-tun
+
+status   /var/log/openvpn/dromos-status.log
+verb 3
+mute 20
+
+# Drop into Dromos's fwmark world: an out script tags the tun device's
+# locally-originated traffic via the mark_local chain (skuid match).
+script-security 2

@@ -1,0 +1,68 @@
+---
+- name: Install Dromos packages
+  ansible.builtin.apt:
+    name: "{{ dromos_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create Dromos config directory
+  ansible.builtin.file:
+    path: "{{ dromos_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Create Dromos secrets directory
+  ansible.builtin.file:
+    path: "{{ dromos_secrets_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Create Dromos cache directory
+  ansible.builtin.file:
+    path: "{{ dromos_cache_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Enable IPv4 forwarding (sysctl persistent)
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_file: /etc/sysctl.d/99-dromos.conf
+    reload: true
+    state: present
+
+- name: Disable rp_filter on Dromos interfaces (will be set when ifaces exist)
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-dromos-rpfilter.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Loose rp_filter on Dromos interfaces.  Strict rp_filter breaks
+      # asymmetric routing via fwmark.  We only loosen our own ifaces.
+      net.ipv4.conf.default.rp_filter = 0
+      net.ipv4.conf.dromos-client.rp_filter = 0
+      net.ipv4.conf.dromos-backbone.rp_filter = 0
+
+- name: Install dromos-routing helper
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../scripts/dromos-routing"
+    dest: /usr/local/sbin/dromos-routing
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install dromos-healthcheck
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../scripts/dromos-healthcheck"
+    dest: /usr/local/sbin/dromos-healthcheck
+    owner: root
+    group: root
+    mode: "0755"

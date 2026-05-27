@@ -1,0 +1,102 @@
+# Dromos integration lab.
+#
+# Topology — three separate Docker networks, each /29.  Phebes is the only
+# host with feet in all three, so the client and the destinations cannot
+# short-circuit each other on L2.  Peleon sits in the "backbone" network
+# with Phebes plus directly on the egress network as a forwarder.
+#
+#   client_net   172.30.10.0/29     dromos-client (172.30.10.5)
+#                                   phebes        (172.30.10.4)  <- client default GW
+#
+#   backbone_net 172.30.20.0/29     phebes        (172.30.20.4)
+#                                   peleon        (172.30.20.3)  <- "foreign" next hop
+#
+#   egress_net   172.30.30.0/24     phebes        (172.30.30.40)  <- "RU" exit
+#                                   peleon        (172.30.30.30)  <- "foreign" exit
+#                                   ru-dst        (172.30.30.10)
+#                                   foreign-dst   (172.30.30.20)
+#
+# Privileged is required only for NET_ADMIN + sysctl + nftables.
+services:
+  ru-dst:
+    image: nicolaka/netshoot:v0.13
+    container_name: dromos-ru-dst
+    networks:
+      egress_net:
+        ipv4_address: 172.30.30.10
+    command: sh -c "python3 -m http.server 80 --bind 0.0.0.0"
+    cap_add: [NET_ADMIN]
+
+  foreign-dst:
+    image: nicolaka/netshoot:v0.13
+    container_name: dromos-foreign-dst
+    networks:
+      egress_net:
+        ipv4_address: 172.30.30.20
+    command: sh -c "python3 -m http.server 80 --bind 0.0.0.0"
+    cap_add: [NET_ADMIN]
+
+  peleon:
+    image: nicolaka/netshoot:v0.13
+    container_name: dromos-peleon
+    networks:
+      backbone_net:
+        ipv4_address: 172.30.20.3
+      egress_net:
+        ipv4_address: 172.30.30.30
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+    volumes:
+      - ./peleon-init.sh:/init.sh:ro
+    command: ["sh", "/init.sh"]
+
+  phebes:
+    image: nicolaka/netshoot:v0.13
+    container_name: dromos-phebes
+    networks:
+      client_net:
+        ipv4_address: 172.30.10.4
+      backbone_net:
+        ipv4_address: 172.30.20.4
+      egress_net:
+        ipv4_address: 172.30.30.40
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+    volumes:
+      - ./phebes-init.sh:/init.sh:ro
+    depends_on: [peleon, ru-dst, foreign-dst]
+    command: ["sh", "/init.sh"]
+
+  client:
+    image: nicolaka/netshoot:v0.13
+    container_name: dromos-client
+    networks:
+      client_net:
+        ipv4_address: 172.30.10.5
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./client-init.sh:/init.sh:ro
+      - ./assertions.sh:/assertions.sh:ro
+    depends_on: [phebes]
+    command: ["sh", "-c", "sh /init.sh && tail -f /dev/null"]
+
+networks:
+  client_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.10.0/29
+  backbone_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.20.0/29
+  egress_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.30.0/24

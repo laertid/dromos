@@ -1,0 +1,16 @@
+{# Peleon side of the backbone. Peleon NATs all forwarded traffic out its eth0. #}
+[Interface]
+Address    = {{ dromos_backbone_peleon_addr | default('10.77.0.2/30') }}
+ListenPort = {{ dromos_backbone_listen_port_peleon | default(51821) }}
+PrivateKey = {{ dromos_backbone_peleon_private_key }}
+MTU        = {{ dromos_backbone_mtu | default(1380) }}
+
+PreUp  = sysctl -w net.ipv6.conf.dromos-backbone.disable_ipv6=1 2>/dev/null || true
+PostUp = /usr/local/sbin/dromos-routing apply peleon
+PreDown = /usr/local/sbin/dromos-routing teardown peleon
+
+[Peer]
+# Phebes
+PublicKey  = {{ dromos_phebes_backbone_public_key }}
+AllowedIPs = {{ dromos_backbone_phebes_addr_only | default('10.77.0.1/32') }}, {{ dromos_client_subnet_v4 | default('10.66.0.0/24') }}
+PersistentKeepalive = 25

@@ -1,0 +1,24 @@
+{# Phebes client-facing WireGuard interface.
+   Rendered to /etc/wireguard/dromos-client.conf.
+   PostUp/PostDown hand off to dromos-routing.sh, which is idempotent. #}
+[Interface]
+Address    = {{ dromos_client_subnet_v4 | default('10.66.0.1/24') }}
+ListenPort = {{ dromos_client_listen_port | default(51820) }}
+PrivateKey = {{ dromos_server_private_key }}
+MTU        = {{ dromos_client_mtu | default(1380) }}
+
+# Avoid IPv6 leaks (v1 is IPv4-only).
+PreUp  = sysctl -w net.ipv6.conf.dromos-client.disable_ipv6=1 2>/dev/null || true
+PostUp = /usr/local/sbin/dromos-routing apply client
+PreDown = /usr/local/sbin/dromos-routing teardown client
+
+{% for user in dromos_users | default([]) %}
+# {{ user.name }}
+[Peer]
+PublicKey  = {{ user.public_key }}
+{% if user.preshared_key is defined %}
+PresharedKey = {{ user.preshared_key }}
+{% endif %}
+AllowedIPs = {{ user.address }}/32
+
+{% endfor %}

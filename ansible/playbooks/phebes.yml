@@ -1,0 +1,8 @@
+---
+- name: Configure Phebes (entry node, RU)
+  hosts: phebes
+  become: true
+  gather_facts: true
+  roles:
+    - common
+    - phebes

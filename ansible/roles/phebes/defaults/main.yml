@@ -1,0 +1,16 @@
+---
+dromos_client_subnet_v4: 10.66.0.0/24
+dromos_client_ifname: dromos-client
+dromos_backbone_ifname: dromos-backbone
+dromos_egress_ifname: eth0
+dromos_client_listen_port: 51820
+dromos_backbone_listen_port_phebes: 51821
+dromos_mark_ru: "0x42"
+dromos_mark_foreign: "0x43"
+dromos_table_ru: 100
+dromos_table_foreign: 101
+dromos_client_mtu: 1380
+dromos_client_dns: 10.66.0.1
+dromos_ss_port: 8388
+dromos_ss_method: chacha20-ietf-poly1305
+dromos_geo_url: https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone

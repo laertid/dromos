@@ -1,0 +1,109 @@
+#!/bin/bash
+# dromos-healthcheck -- single-shot health probe.  Exit 0 on all green.
+#
+set -uo pipefail
+
+VERBOSE=0
+[[ "${1:-}" == "--verbose" || "${1:-}" == "-v" ]] && VERBOSE=1
+
+CLIENT_IF=${DROMOS_CLIENT_IF:-dromos-client}
+BACKBONE_IF=${DROMOS_BACKBONE_IF:-dromos-backbone}
+PEER_ADDR=${DROMOS_PELEON_BACKBONE_ADDR:-10.77.0.2}
+NFT_TABLE=${DROMOS_NFT_TABLE:-dromos}
+RU_SET=${DROMOS_RU_SET:-dromos_ru4}
+MARK_RU=${DROMOS_MARK_RU:-0x42}
+MARK_FOREIGN=${DROMOS_MARK_FOREIGN:-0x43}
+TABLE_RU=${DROMOS_TABLE_RU:-100}
+TABLE_FOREIGN=${DROMOS_TABLE_FOREIGN:-101}
+CACHE_DIR=${DROMOS_CACHE_DIR:-/var/cache/dromos}
+
+fails=0
+ok()   { printf '[OK]   %s\n' "$*"; }
+fail() { printf '[FAIL] %s\n' "$*"; fails=$((fails+1)); }
+warn() { printf '[WARN] %s\n' "$*"; }
+
+# 1. WG interfaces up
+if ip link show "$CLIENT_IF" 2>/dev/null | grep -q 'state UNKNOWN\|state UP'; then
+    peers=$(wg show "$CLIENT_IF" peers 2>/dev/null | wc -l)
+    ok "$CLIENT_IF up, peers: $peers"
+else
+    fail "$CLIENT_IF down or missing"
+fi
+
+if ip link show "$BACKBONE_IF" 2>/dev/null | grep -q 'state UNKNOWN\|state UP'; then
+    hs=$(wg show "$BACKBONE_IF" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+    if [[ -n "$hs" && "$hs" -gt 0 ]]; then
+        age=$(( $(date +%s) - hs ))
+        if (( age < 180 )); then
+            ok "$BACKBONE_IF handshake age: ${age}s"
+        else
+            fail "$BACKBONE_IF handshake stale: ${age}s"
+        fi
+    else
+        warn "$BACKBONE_IF has no handshake yet"
+    fi
+else
+    fail "$BACKBONE_IF down or missing (skip if running on Peleon-only host)"
+fi
+
+# 2. ipset / nft set
+count=$(nft list set inet "$NFT_TABLE" "$RU_SET" 2>/dev/null | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' || true)
+if (( count > 100 )); then
+    ok "ipset $RU_SET entries: $count"
+else
+    fail "ipset $RU_SET has only $count entries"
+fi
+
+# 3. cache freshness
+if [[ -r "$CACHE_DIR/ipset-ru4.last-update" ]]; then
+    last=$(cat "$CACHE_DIR/ipset-ru4.last-update")
+    last_ts=$(date -d "$last" +%s 2>/dev/null || echo 0)
+    age_d=$(( ($(date +%s) - last_ts) / 86400 ))
+    if (( age_d < 14 )); then
+        ok "geobase cache age: ${age_d}d"
+    else
+        warn "geobase cache age: ${age_d}d (>= 14d)"
+    fi
+else
+    warn "no geobase cache timestamp"
+fi
+
+# 4. ip rule entries
+if ip rule show | grep -q "fwmark $MARK_RU lookup $TABLE_RU"; then
+    ok "ip rule fwmark $MARK_RU -> $TABLE_RU present"
+else
+    fail "ip rule fwmark $MARK_RU -> $TABLE_RU missing"
+fi
+if ip rule show | grep -q "fwmark $MARK_FOREIGN lookup $TABLE_FOREIGN"; then
+    ok "ip rule fwmark $MARK_FOREIGN -> $TABLE_FOREIGN present"
+else
+    fail "ip rule fwmark $MARK_FOREIGN -> $TABLE_FOREIGN missing"
+fi
+
+# 5. nft table present
+chains=$(nft list table inet "$NFT_TABLE" 2>/dev/null | grep -c '^[[:space:]]*chain ' || true)
+if (( chains >= 4 )); then
+    ok "nftables table inet $NFT_TABLE present, $chains chains"
+else
+    fail "nftables table inet $NFT_TABLE missing or incomplete ($chains chains)"
+fi
+
+# 6. backbone ping
+if ping -c1 -W2 -I "$BACKBONE_IF" "$PEER_ADDR" >/dev/null 2>&1; then
+    rtt=$(ping -c1 -W2 -I "$BACKBONE_IF" "$PEER_ADDR" 2>/dev/null | awk -F'time=' '/time=/{print $2; exit}' | awk '{print $1}')
+    ok "ping $PEER_ADDR via $BACKBONE_IF: ${rtt}ms"
+else
+    fail "ping $PEER_ADDR via $BACKBONE_IF failed"
+fi
+
+if (( VERBOSE )); then
+    echo "---"
+    wg show 2>/dev/null || true
+    ip -d link show "$CLIENT_IF" 2>/dev/null || true
+    ip -d link show "$BACKBONE_IF" 2>/dev/null || true
+    ip rule show
+    ip route show table "$TABLE_RU" 2>/dev/null
+    ip route show table "$TABLE_FOREIGN" 2>/dev/null
+fi
+
+exit $(( fails > 0 ))

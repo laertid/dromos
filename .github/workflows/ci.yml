@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          pip install pytest jinja2
+          sudo apt-get update
+          sudo apt-get install -y wireguard-tools shellcheck
+      - name: Lint shell scripts
+        run: shellcheck scripts/dromos-routing scripts/dromos-geo-update scripts/dromos-healthcheck scripts/dromos-backup scripts/dromos-restore || true
+      - name: Run unit tests
+        run: pytest -v tests/unit/
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Look for likely secret material
+        run: |
+          set -e
+          ! git grep -nE 'PRIVATE KEY-----|wgPrivateKey|BEGIN EC PRIVATE|BEGIN RSA PRIVATE' -- . \
+              ':!.github/workflows/*' \
+              ':!docs/*' || (echo "secret-looking material found" && exit 1)

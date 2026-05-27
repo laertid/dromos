@@ -1,0 +1,7 @@
+#!/bin/bash
+# Convenience wrapper used by docs/rebuild-phebes.md.
+# Usage: dromos-restore <local_backup_dir>  (reads PHEBES_TARGET env or arg2)
+set -euo pipefail
+LOCAL_DIR=${1:?backup dir}
+TARGET=${2:-${PHEBES_TARGET:?set PHEBES_TARGET=user@host}}
+exec "$(dirname "$0")/dromos-backup" restore "$TARGET" "$LOCAL_DIR"

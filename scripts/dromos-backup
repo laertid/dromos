@@ -1,0 +1,78 @@
+#!/bin/bash
+# dromos-backup -- pull / restore the operator-owned backup of a Phebes node.
+#
+# Usage:
+#   dromos-backup pull    <ssh_target> <local_dir>
+#   dromos-backup restore <ssh_target> <local_dir>
+#
+# The backup contains all the material needed to recreate Phebes on a new VPS.
+# Stored as a plain directory tree on the operator workstation.  Encrypt the
+# enclosing folder yourself (e.g. via age, gocryptfs, an encrypted disk).
+#
+set -euo pipefail
+
+PATHS=(
+    /etc/dromos/secrets
+    /etc/dromos/users.json
+    /etc/dromos/geo.conf
+    /var/cache/dromos/ipset-ru4.cache
+    /var/cache/dromos/ipset-ru4.last-update
+    /etc/wireguard/dromos-client.conf
+    /etc/wireguard/dromos-backbone.conf
+)
+
+usage() {
+    cat >&2 <<EOF
+Usage:
+  $0 pull    <ssh_target> <local_dir>
+  $0 restore <ssh_target> <local_dir>
+
+Examples:
+  $0 pull    root@phebes.example.ru ~/dromos-backup
+  $0 restore root@new-phebes.example.ru ~/dromos-backup
+EOF
+    exit 2
+}
+
+cmd=${1:-}
+target=${2:-}
+local_dir=${3:-}
+
+[[ -z "$cmd" || -z "$target" || -z "$local_dir" ]] && usage
+
+case "$cmd" in
+    pull)
+        mkdir -p "$local_dir"
+        for p in "${PATHS[@]}"; do
+            d=$(dirname "$p")
+            mkdir -p "$local_dir$d"
+            # -p preserves perms, -a follows symlinks
+            if rsync -aR --rsync-path='sudo rsync' "${target}:${p}" "$local_dir/" 2>/dev/null; then
+                echo "pulled $p"
+            else
+                echo "WARN: could not pull $p (may not exist)" >&2
+            fi
+        done
+        echo "backup at $local_dir"
+        ;;
+    restore)
+        [[ -d "$local_dir" ]] || { echo "no such dir $local_dir" >&2; exit 1; }
+        # rsync each path back
+        for p in "${PATHS[@]}"; do
+            if [[ -e "$local_dir$p" ]]; then
+                rsync -aR --rsync-path='sudo rsync' "$local_dir/.${p}" "${target}:/" 2>/dev/null \
+                    || rsync -a --rsync-path='sudo rsync' "$local_dir$p" "${target}:${p}"
+                echo "restored $p"
+            fi
+        done
+        # bring services back up
+        ssh "$target" "sudo systemctl daemon-reload && \
+            sudo systemctl restart dromos-nft.service && \
+            sudo systemctl restart wg-quick@dromos-backbone.service && \
+            sudo systemctl restart wg-quick@dromos-client.service"
+        ssh "$target" "sudo dromos-healthcheck" || true
+        ;;
+    *)
+        usage
+        ;;
+esac

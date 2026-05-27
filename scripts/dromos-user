@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""dromos-user: add / remove / list users.
+
+State of truth: /etc/dromos/users.json
+Side effects:
+  - /etc/dromos/secrets/clients/<name>/{priv,pub,preshared,<name>.conf}
+  - /etc/wireguard/dromos-client.conf  (regenerated atomically, wg syncconf)
+
+Idempotent.  Safe to run while dromos-client is up; uses `wg syncconf` so the
+interface is not bounced (no client disruption).
+"""
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("DROMOS_CONFIG_DIR", "/etc/dromos"))
+SECRETS_DIR = Path(os.environ.get("DROMOS_SECRETS_DIR", "/etc/dromos/secrets"))
+WG_CONF = Path(os.environ.get("DROMOS_WG_CONF", "/etc/wireguard/dromos-client.conf"))
+CLIENT_SUBNET = os.environ.get("DROMOS_CLIENT_SUBNET", "10.66.0.0/24")
+CLIENT_IF = os.environ.get("DROMOS_CLIENT_IF", "dromos-client")
+LISTEN_PORT = int(os.environ.get("DROMOS_CLIENT_PORT", "51820"))
+ENDPOINT = os.environ.get("DROMOS_PHEBES_ENDPOINT", "phebes.example.ru")
+DNS = os.environ.get("DROMOS_CLIENT_DNS", "10.66.0.1")
+MTU = int(os.environ.get("DROMOS_CLIENT_MTU", "1380"))
+
+USERS_JSON = CONFIG_DIR / "users.json"
+
+
+def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
+
+
+def _genkey() -> tuple[str, str]:
+    priv = _run(["wg", "genkey"]).stdout.strip()
+    pub = _run(["wg", "pubkey"], input=priv).stdout.strip()
+    return priv, pub
+
+
+def _genpsk() -> str:
+    return _run(["wg", "genpsk"]).stdout.strip()
+
+
+def load_users() -> dict:
+    if USERS_JSON.exists():
+        return json.loads(USERS_JSON.read_text())
+    return {"users": []}
+
+
+def save_users(state: dict) -> None:
+    USERS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    tmp = USERS_JSON.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    os.chmod(tmp, 0o600)
+    tmp.replace(USERS_JSON)
+
+
+def next_free_ip(state: dict) -> str:
+    net = ipaddress.ip_network(CLIENT_SUBNET)
+    used = {u["address"] for u in state["users"]}
+    used.add(str(next(net.hosts())))  # .1 is the server
+    for h in net.hosts():
+        s = str(h)
+        if s not in used:
+            return s
+    raise SystemExit("subnet exhausted")
+
+
+def render_server_conf(state: dict) -> str:
+    server_priv = (SECRETS_DIR / "server.key").read_text().strip()
+    lines = [
+        "[Interface]",
+        f"Address    = {next(ipaddress.ip_network(CLIENT_SUBNET).hosts())}/24",
+        f"ListenPort = {LISTEN_PORT}",
+        f"PrivateKey = {server_priv}",
+        f"MTU        = {MTU}",
+        "PreUp  = sysctl -w net.ipv6.conf.dromos-client.disable_ipv6=1 2>/dev/null || true",
+        "PostUp = /usr/local/sbin/dromos-routing apply client",
+        "PreDown = /usr/local/sbin/dromos-routing teardown client",
+        "",
+    ]
+    for u in state["users"]:
+        lines += [
+            f"# {u['name']}",
+            "[Peer]",
+            f"PublicKey  = {u['public_key']}",
+            f"PresharedKey = {u['preshared_key']}",
+            f"AllowedIPs = {u['address']}/32",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def reload_wg(conf_text: str) -> None:
+    WG_CONF.parent.mkdir(parents=True, exist_ok=True)
+    tmp = WG_CONF.with_suffix(".tmp")
+    tmp.write_text(conf_text)
+    os.chmod(tmp, 0o600)
+    tmp.replace(WG_CONF)
+    # Hot-reload without bouncing the interface
+    try:
+        proc = subprocess.run(
+            ["wg-quick", "strip", str(WG_CONF)],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["wg", "syncconf", CLIENT_IF, "/dev/stdin"],
+            check=True, input=proc.stdout, text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"WARN: hot-reload failed ({e}); config on disk is updated, manual restart may be needed", file=sys.stderr)
+
+
+def render_client_conf(user: dict) -> str:
+    server_pub = (SECRETS_DIR / "server.pub").read_text().strip()
+    return f"""[Interface]
+PrivateKey = {user['private_key']}
+Address    = {user['address']}/32
+DNS        = {DNS}
+MTU        = {MTU}
+
+[Peer]
+PublicKey  = {server_pub}
+PresharedKey = {user['preshared_key']}
+Endpoint   = {ENDPOINT}:{LISTEN_PORT}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+"""
+
+
+def cmd_add(args) -> int:
+    state = load_users()
+    if any(u["name"] == args.name for u in state["users"]):
+        print(f"user {args.name} already exists", file=sys.stderr)
+        return 1
+    priv, pub = _genkey()
+    psk = _genpsk()
+    addr = next_free_ip(state)
+    user = {
+        "name": args.name,
+        "address": addr,
+        "public_key": pub,
+        "preshared_key": psk,
+        # private_key is also stored so we can re-print the config; operator
+        # backup is canonical.
+        "private_key": priv,
+    }
+    state["users"].append(user)
+    save_users(state)
+
+    user_dir = SECRETS_DIR / "clients" / args.name
+    user_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(user_dir, 0o700)
+    (user_dir / "priv").write_text(priv + "\n")
+    os.chmod(user_dir / "priv", 0o600)
+    (user_dir / "pub").write_text(pub + "\n")
+    (user_dir / "preshared").write_text(psk + "\n")
+    os.chmod(user_dir / "preshared", 0o600)
+    client_conf = render_client_conf(user)
+    (user_dir / f"{args.name}.conf").write_text(client_conf)
+    os.chmod(user_dir / f"{args.name}.conf", 0o600)
+
+    reload_wg(render_server_conf(state))
+    print(client_conf)
+    print(f"# wrote {user_dir / (args.name + '.conf')}", file=sys.stderr)
+    return 0
+
+
+def cmd_remove(args) -> int:
+    state = load_users()
+    before = len(state["users"])
+    state["users"] = [u for u in state["users"] if u["name"] != args.name]
+    if len(state["users"]) == before:
+        print(f"user {args.name} not found", file=sys.stderr)
+        return 1
+    save_users(state)
+    user_dir = SECRETS_DIR / "clients" / args.name
+    if user_dir.exists():
+        # Zero priv before unlink, for forensic hygiene.
+        for f in user_dir.iterdir():
+            if f.name in ("priv", "preshared"):
+                f.write_text("\x00" * 64)
+            f.unlink()
+        user_dir.rmdir()
+    reload_wg(render_server_conf(state))
+    print(f"removed {args.name}", file=sys.stderr)
+    return 0
+
+
+def cmd_list(args) -> int:
+    state = load_users()
+    print(f"{'name':<20} {'address':<15} {'public_key':<45}")
+    for u in state["users"]:
+        print(f"{u['name']:<20} {u['address']:<15} {u['public_key']:<45}")
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="dromos-user")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("add"); a.add_argument("name"); a.set_defaults(func=cmd_add)
+    r = sub.add_parser("remove"); r.add_argument("name"); r.set_defaults(func=cmd_remove)
+    sub.add_parser("list").set_defaults(func=cmd_list)
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

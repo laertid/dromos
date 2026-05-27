@@ -1,0 +1,17 @@
+{# Phebes side of the Phebes<->Peleon backbone. #}
+[Interface]
+Address    = {{ dromos_backbone_phebes_addr | default('10.77.0.1/30') }}
+ListenPort = {{ dromos_backbone_listen_port_phebes | default(51821) }}
+PrivateKey = {{ dromos_backbone_phebes_private_key }}
+MTU        = {{ dromos_backbone_mtu | default(1380) }}
+
+PreUp  = sysctl -w net.ipv6.conf.dromos-backbone.disable_ipv6=1 2>/dev/null || true
+PostUp = /usr/local/sbin/dromos-routing apply backbone
+PreDown = /usr/local/sbin/dromos-routing teardown backbone
+
+[Peer]
+# Peleon
+PublicKey  = {{ dromos_peleon_public_key }}
+Endpoint   = {{ dromos_peleon_host }}:{{ dromos_backbone_listen_port_peleon | default(51821) }}
+AllowedIPs = {{ dromos_backbone_peleon_addr_only | default('10.77.0.2/32') }}, 0.0.0.0/0
+PersistentKeepalive = 25

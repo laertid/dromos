@@ -1,0 +1,13 @@
+---
+dromos_packages:
+  - wireguard
+  - wireguard-tools
+  - nftables
+  - ipset
+  - curl
+  - jq
+  - python3
+  - python3-jinja2
+dromos_secrets_dir: /etc/dromos/secrets
+dromos_cache_dir: /var/cache/dromos
+dromos_config_dir: /etc/dromos

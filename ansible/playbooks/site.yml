@@ -1,0 +1,4 @@
+---
+# Full Dromos site.  Apply common to both, then role-specific.
+- import_playbook: peleon.yml
+- import_playbook: phebes.yml

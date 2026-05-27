@@ -1,0 +1,14 @@
+---
+- name: reload dromos-backbone
+  ansible.builtin.systemd:
+    name: wg-quick@dromos-backbone.service
+    state: restarted
+
+- name: reload dromos-nft
+  ansible.builtin.systemd:
+    name: dromos-nft.service
+    state: restarted
+
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true

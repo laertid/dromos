@@ -1,0 +1,20 @@
+# Live secrets and user state
+ansible/inventory/prod.ini
+ansible/inventory/*.local.ini
+**/secrets/
+**/users.json
+*.key
+*.priv
+*.pem
+!ansible/roles/peleon/files/.gitkeep
+!ansible/roles/phebes/files/.gitkeep
+!ansible/roles/common/files/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# OS
+.DS_Store

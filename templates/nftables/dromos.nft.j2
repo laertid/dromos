@@ -1,0 +1,64 @@
+{# Isolated nftables table.  Owned entirely by Dromos.
+   We never edit any other table.  `nft -f` loads this atomically. #}
+
+table inet dromos {
+    set dromos_ru4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        # Populated by dromos-geo-update at runtime.
+    }
+
+    # ---- mark client packets at PREROUTING on dromos-client ----
+    chain mark_clients {
+        type filter hook prerouting priority mangle; policy accept;
+        iifname "{{ dromos_client_ifname | default('dromos-client') }}" \
+            ip daddr @dromos_ru4 meta mark set {{ dromos_mark_ru | default('0x42') }} return
+        iifname "{{ dromos_client_ifname | default('dromos-client') }}" \
+            meta mark set {{ dromos_mark_foreign | default('0x43') }}
+    }
+
+    # ---- mark locally-originated SS/OVPN traffic the same way ----
+    chain mark_local {
+        type route hook output priority mangle; policy accept;
+        meta mark != 0 return
+        meta skuid {{ dromos_ss_uid | default(998) }} ip daddr @dromos_ru4 \
+            meta mark set {{ dromos_mark_ru | default('0x42') }} return
+        meta skuid {{ dromos_ss_uid | default(998) }} \
+            meta mark set {{ dromos_mark_foreign | default('0x43') }}
+        meta skuid {{ dromos_ovpn_uid | default(997) }} ip daddr @dromos_ru4 \
+            meta mark set {{ dromos_mark_ru | default('0x42') }} return
+        meta skuid {{ dromos_ovpn_uid | default(997) }} \
+            meta mark set {{ dromos_mark_foreign | default('0x43') }}
+    }
+
+    # ---- forward chain: be permissive, but only for Dromos ifaces ----
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+        iifname "{{ dromos_client_ifname | default('dromos-client') }}" \
+            oifname { "{{ dromos_backbone_ifname | default('dromos-backbone') }}", "{{ dromos_egress_ifname | default('eth0') }}" } \
+            accept
+        iifname "{{ dromos_backbone_ifname | default('dromos-backbone') }}" \
+            oifname "{{ dromos_client_ifname | default('dromos-client') }}" \
+            ct state established,related accept
+    }
+
+    # ---- masquerade only on the egress paths we own ----
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        # Phebes: NAT direct-exit (RU) clients out the host eth0
+        iifname "{{ dromos_client_ifname | default('dromos-client') }}" \
+            oifname "{{ dromos_egress_ifname | default('eth0') }}" \
+            meta mark {{ dromos_mark_ru | default('0x42') }} \
+            masquerade
+        # Phebes: NAT to backbone for foreign-marked clients
+        iifname "{{ dromos_client_ifname | default('dromos-client') }}" \
+            oifname "{{ dromos_backbone_ifname | default('dromos-backbone') }}" \
+            meta mark {{ dromos_mark_foreign | default('0x43') }} \
+            masquerade
+        # Peleon: NAT everything coming off backbone out to eth0
+        iifname "{{ dromos_backbone_ifname | default('dromos-backbone') }}" \
+            oifname "{{ dromos_egress_ifname | default('eth0') }}" \
+            masquerade
+    }
+}

@@ -1,0 +1,57 @@
+#!/bin/bash
+# dromos-geo-update -- refresh the dromos_ru4 ipset atomically.
+#
+# Source defaults to ipdeny RU aggregated zone.  Configurable via /etc/dromos/geo.conf.
+# Validation: must contain >= MIN_CIDRS lines that look like IPv4 CIDRs.
+# On failure: keep the existing set, log, exit non-zero.  Never empty.
+#
+set -euo pipefail
+
+CONF=/etc/dromos/geo.conf
+CACHE_DIR=${DROMOS_CACHE_DIR:-/var/cache/dromos}
+SET_NAME=${DROMOS_RU_SET:-dromos_ru4}
+NFT_TABLE=${DROMOS_NFT_TABLE:-dromos}
+MIN_CIDRS=${DROMOS_MIN_CIDRS:-100}
+GEO_URL_DEFAULT="https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone"
+
+# shellcheck disable=SC1090
+[[ -r "$CONF" ]] && . "$CONF"
+GEO_URL="${GEO_URL:-$GEO_URL_DEFAULT}"
+
+log() { printf '[dromos-geo-update] %s\n' "$*" >&2; }
+
+mkdir -p "$CACHE_DIR"
+TMP=$(mktemp)
+trap 'rm -f "$TMP" "$TMP.cidrs"' EXIT
+
+log "fetching $GEO_URL"
+if ! curl -fsSL --max-time 30 -o "$TMP" "$GEO_URL"; then
+    log "ERROR: download failed; keeping existing set"
+    exit 1
+fi
+
+grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]+$' "$TMP" > "$TMP.cidrs" || true
+COUNT=$(wc -l < "$TMP.cidrs")
+log "downloaded $COUNT CIDRs"
+if (( COUNT < MIN_CIDRS )); then
+    log "ERROR: only $COUNT CIDRs (< $MIN_CIDRS); refusing to swap"
+    exit 2
+fi
+
+# Build the atomic swap as a single nft script.
+NFT_BATCH=$(mktemp); trap 'rm -f "$TMP" "$TMP.cidrs" "$NFT_BATCH"' EXIT
+{
+    echo "flush set inet ${NFT_TABLE} ${SET_NAME}"
+    printf 'add element inet %s %s { %s }\n' \
+        "${NFT_TABLE}" "${SET_NAME}" \
+        "$(paste -sd, "$TMP.cidrs")"
+} > "$NFT_BATCH"
+
+if nft -f "$NFT_BATCH"; then
+    cp "$TMP.cidrs" "$CACHE_DIR/ipset-ru4.cache"
+    date -u +%FT%TZ > "$CACHE_DIR/ipset-ru4.last-update"
+    log "OK: swapped ${SET_NAME} to $COUNT CIDRs"
+else
+    log "ERROR: nft swap failed; existing set retained"
+    exit 3
+fi

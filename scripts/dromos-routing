@@ -1,0 +1,126 @@
+#!/bin/bash
+# dromos-routing -- apply / teardown the policy-routing rules Dromos owns.
+#
+# Idempotent.  Touches only Dromos resources:
+#   - ip rule entries with fwmark 0x42 / 0x43
+#   - ip route into tables 100 / 101
+#   - the dromos-client / dromos-backbone interfaces' rp_filter
+#
+# Does NOT touch:
+#   - the host default route
+#   - any other ip rule
+#   - any other nftables table
+#   - sshd
+#
+set -euo pipefail
+
+DROMOS_CLIENT_IF="${DROMOS_CLIENT_IF:-dromos-client}"
+DROMOS_BACKBONE_IF="${DROMOS_BACKBONE_IF:-dromos-backbone}"
+DROMOS_EGRESS_IF="${DROMOS_EGRESS_IF:-eth0}"
+DROMOS_MARK_RU="${DROMOS_MARK_RU:-0x42}"
+DROMOS_MARK_FOREIGN="${DROMOS_MARK_FOREIGN:-0x43}"
+DROMOS_TABLE_RU="${DROMOS_TABLE_RU:-100}"
+DROMOS_TABLE_FOREIGN="${DROMOS_TABLE_FOREIGN:-101}"
+
+log() { printf '[dromos-routing] %s\n' "$*" >&2; }
+
+ensure_rt_tables() {
+    local f=/etc/iproute2/rt_tables
+    grep -q "^${DROMOS_TABLE_RU}[[:space:]]*dromos_ru$" "$f" 2>/dev/null \
+        || echo "${DROMOS_TABLE_RU}    dromos_ru" >> "$f"
+    grep -q "^${DROMOS_TABLE_FOREIGN}[[:space:]]*dromos_foreign$" "$f" 2>/dev/null \
+        || echo "${DROMOS_TABLE_FOREIGN}    dromos_foreign" >> "$f"
+}
+
+# Get the host's current default-route gateway, without touching it.
+host_default_gw() {
+    ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}'
+}
+
+rule_add_idempotent() {
+    local args="$*"
+    if ! ip rule show | grep -q "fwmark ${args##*fwmark }"; then
+        ip rule add $args
+    fi
+}
+
+apply_client() {
+    log "apply client-side routing (Phebes)"
+    ensure_rt_tables
+
+    local gw
+    gw=$(host_default_gw)
+    if [[ -z "$gw" ]]; then
+        log "WARN: no default gateway found; table ${DROMOS_TABLE_RU} will be empty"
+    else
+        # Mirror the host default into table 100 (RU direct exit).
+        ip route replace default via "$gw" dev "$DROMOS_EGRESS_IF" table "$DROMOS_TABLE_RU"
+    fi
+
+    # table 101: default goes to Peleon via backbone iface
+    if ip link show "$DROMOS_BACKBONE_IF" >/dev/null 2>&1; then
+        ip route replace default dev "$DROMOS_BACKBONE_IF" table "$DROMOS_TABLE_FOREIGN"
+    else
+        log "NOTE: $DROMOS_BACKBONE_IF not up yet; foreign table will fill on backbone bringup"
+    fi
+
+    rule_add_idempotent "fwmark $DROMOS_MARK_RU      lookup $DROMOS_TABLE_RU"
+    rule_add_idempotent "fwmark $DROMOS_MARK_FOREIGN lookup $DROMOS_TABLE_FOREIGN"
+
+    sysctl -qw "net.ipv4.conf.${DROMOS_CLIENT_IF}.rp_filter=0" || true
+}
+
+apply_backbone() {
+    log "apply backbone routing (Phebes)"
+    ensure_rt_tables
+    ip route replace default dev "$DROMOS_BACKBONE_IF" table "$DROMOS_TABLE_FOREIGN"
+    sysctl -qw "net.ipv4.conf.${DROMOS_BACKBONE_IF}.rp_filter=0" || true
+}
+
+apply_peleon() {
+    log "apply Peleon-side routing (no policy routes; just rp_filter)"
+    sysctl -qw "net.ipv4.conf.${DROMOS_BACKBONE_IF}.rp_filter=0" || true
+}
+
+teardown_client() {
+    log "teardown client-side routing"
+    ip rule del fwmark "$DROMOS_MARK_RU"      lookup "$DROMOS_TABLE_RU"      2>/dev/null || true
+    ip rule del fwmark "$DROMOS_MARK_FOREIGN" lookup "$DROMOS_TABLE_FOREIGN" 2>/dev/null || true
+    ip route flush table "$DROMOS_TABLE_RU"      2>/dev/null || true
+    ip route flush table "$DROMOS_TABLE_FOREIGN" 2>/dev/null || true
+}
+
+teardown_backbone() {
+    log "teardown backbone routing"
+    ip route flush table "$DROMOS_TABLE_FOREIGN" 2>/dev/null || true
+}
+
+teardown_peleon() { :; }
+
+usage() {
+    cat >&2 <<EOF
+Usage: $0 apply {client|backbone|peleon}
+       $0 teardown {client|backbone|peleon}
+EOF
+    exit 2
+}
+
+case "${1:-}" in
+    apply)
+        case "${2:-}" in
+            client)   apply_client ;;
+            backbone) apply_backbone ;;
+            peleon)   apply_peleon ;;
+            *) usage ;;
+        esac
+        ;;
+    teardown)
+        case "${2:-}" in
+            client)   teardown_client ;;
+            backbone) teardown_backbone ;;
+            peleon)   teardown_peleon ;;
+            *) usage ;;
+        esac
+        ;;
+    *) usage ;;
+esac
