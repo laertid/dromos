@@ -1,0 +1,47 @@
+---
+# Bootstrap the Phebes<->Peleon WireGuard backbone keypairs.
+#
+# Runs across BOTH hosts before any role play. For each host it:
+#   1. ensures the secrets directory exists,
+#   2. generates the backbone keypair if missing (idempotent),
+#   3. reads the *public* key and publishes it as a host fact.
+#
+# Because facts set here persist for the rest of the ansible-playbook run, the
+# peleon.yml / phebes.yml plays that follow can read the *other* host's public
+# key via hostvars and render both backbone configs in a single clean install.
+#
+# Only public keys are read into Ansible memory; private keys never leave the
+# host they were generated on.
+- name: Bootstrap Dromos backbone keypairs
+  hosts: dromos
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Ensure secrets directory exists
+      ansible.builtin.file:
+        path: "{{ dromos_secrets_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Ensure backbone keypair exists
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 077
+        if [ ! -f "{{ dromos_secrets_dir }}/backbone.key" ]; then
+          wg genkey | tee "{{ dromos_secrets_dir }}/backbone.key" \
+            | wg pubkey > "{{ dromos_secrets_dir }}/backbone.pub"
+        fi
+      args:
+        executable: /bin/bash
+        creates: "{{ dromos_secrets_dir }}/backbone.pub"
+
+    - name: Read backbone public key
+      ansible.builtin.slurp:
+        src: "{{ dromos_secrets_dir }}/backbone.pub"
+      register: _backbone_pub
+
+    - name: Publish backbone public key as a host fact
+      ansible.builtin.set_fact:
+        dromos_backbone_public_key: "{{ _backbone_pub.content | b64decode | trim }}"
