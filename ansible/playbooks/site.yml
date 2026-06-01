@@ -1,4 +1,14 @@
 ---
-# Full Dromos site.  Apply common to both, then role-specific.
+# Full Dromos site.
+#
+# A clean install needs each backbone peer to know the *other* peer's public
+# key before its WireGuard config can be rendered. The bootstrap play below
+# runs first across both hosts: it generates the backbone keypairs (idempotent,
+# no secrets ever leave the hosts except the *public* halves), slurps the public
+# keys, and publishes them as facts on both hosts via hostvars. The role plays
+# that follow then render both backbone configs in a single run.
+#
+# Run order matters: keep bootstrap.yml first.
+- import_playbook: bootstrap.yml
 - import_playbook: peleon.yml
 - import_playbook: phebes.yml

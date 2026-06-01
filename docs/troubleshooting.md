@@ -2,6 +2,66 @@
 
 Recipes for common Dromos failures. Each starts with the symptom.
 
+## Install / first run
+
+### `set: Illegal option -o pipefail`
+
+Symptom (during `ansible-playbook`):
+
+```
+/bin/sh: 1: set: Illegal option -o pipefail
+```
+
+Cause: a `shell:` task used bash syntax (`set -o pipefail`) but ran under
+`/bin/sh` (dash on Debian/Ubuntu). Fixed in this repo — every backbone/keygen
+`shell:` task now sets `args: executable: /bin/bash`. If you hit this in a
+custom task, add the same:
+
+```yaml
+- ansible.builtin.shell: |
+    set -euo pipefail
+    ...
+  args:
+    executable: /bin/bash
+```
+
+### `AnsibleUndefinedVariable: 'dromos_peleon_public_key' is undefined`
+
+(or the symmetric `dromos_phebes_backbone_public_key is undefined`)
+
+Cause: the backbone config render ran before the peer node's public key was
+known. On a clean install this is now handled automatically by `bootstrap.yml`,
+which runs first inside `site.yml` and exchanges both public keys. The fix is
+simply to run the full site playbook:
+
+```bash
+ansible-playbook -i ansible/inventory/prod.ini ansible/playbooks/site.yml
+```
+
+If you are running a **single** node playbook (`phebes.yml` or `peleon.yml`) on
+its own, the cross-host exchange doesn't happen — pass the peer's backbone
+public key explicitly. The key lives at `/etc/dromos/secrets/backbone.pub` on
+each node:
+
+```bash
+# rendering Phebes alone -> needs Peleon's backbone public key
+ansible-playbook -i ansible/inventory/prod.ini ansible/playbooks/phebes.yml \
+  -e dromos_peleon_public_key="$(ssh root@PELEON cat /etc/dromos/secrets/backbone.pub)"
+
+# rendering Peleon alone -> needs Phebes' backbone public key
+ansible-playbook -i ansible/inventory/prod.ini ansible/playbooks/peleon.yml \
+  -e dromos_phebes_backbone_public_key="$(ssh root@PHEBES cat /etc/dromos/secrets/backbone.pub)"
+```
+
+If a node hasn't generated its backbone key yet, generate it first (idempotent):
+
+```bash
+ssh root@PELEON 'umask 077; mkdir -p /etc/dromos/secrets; \
+  test -f /etc/dromos/secrets/backbone.key || \
+  wg genkey | tee /etc/dromos/secrets/backbone.key | wg pubkey > /etc/dromos/secrets/backbone.pub; \
+  cat /etc/dromos/secrets/backbone.pub'
+```
+
 ## "I can connect but nothing loads"
 
 Most likely Phebes is up but the second hop is broken.

@@ -1,0 +1,5 @@
+---
+# Galaxy collections the roles depend on. Install before running playbooks:
+#   ansible-galaxy collection install -r ansible/requirements.yml
+collections:
+  - name: ansible.posix   # provides ansible.posix.sysctl (used by the common role)

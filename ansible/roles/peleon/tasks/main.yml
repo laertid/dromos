@@ -3,10 +3,12 @@
   ansible.builtin.shell: |
     set -euo pipefail
     umask 077
-    test -f {{ dromos_secrets_dir }}/backbone.key || {
-      wg genkey | tee {{ dromos_secrets_dir }}/backbone.key | wg pubkey > {{ dromos_secrets_dir }}/backbone.pub
-    }
+    if [ ! -f "{{ dromos_secrets_dir }}/backbone.key" ]; then
+      wg genkey | tee "{{ dromos_secrets_dir }}/backbone.key" \
+        | wg pubkey > "{{ dromos_secrets_dir }}/backbone.pub"
+    fi
   args:
+    executable: /bin/bash
     creates: "{{ dromos_secrets_dir }}/backbone.pub"
 
 - name: Slurp backbone private key
@@ -18,9 +20,30 @@
   ansible.builtin.set_fact:
     dromos_backbone_peleon_private_key: "{{ _backbone_key.content | b64decode | trim }}"
 
+# Resolve Phebes' backbone public key. Order of preference:
+#   1. an explicit inventory / -e override (dromos_phebes_backbone_public_key)
+#   2. the fact published by bootstrap.yml on the Phebes host (site.yml run)
+# This lets `site.yml` work on a clean install while a standalone `peleon.yml`
+# run still works when the operator passes the key in.
+- name: Resolve Phebes backbone public key
+  ansible.builtin.set_fact:
+    dromos_phebes_backbone_public_key: >-
+      {{ dromos_phebes_backbone_public_key
+         if dromos_phebes_backbone_public_key is defined
+         else hostvars[groups['phebes'][0]].dromos_backbone_public_key }}
+  when: >-
+    dromos_phebes_backbone_public_key is defined
+    or (groups['phebes'] is defined
+        and groups['phebes'] | length > 0
+        and hostvars[groups['phebes'][0]].dromos_backbone_public_key is defined)
+
 - name: Require Phebes backbone public key
   ansible.builtin.fail:
-    msg: "dromos_phebes_backbone_public_key must be set in inventory or via -e"
+    msg: >-
+      dromos_phebes_backbone_public_key is not set. Run the full site.yml (which
+      bootstraps and exchanges both backbone public keys automatically), or pass
+      it explicitly: -e dromos_phebes_backbone_public_key=<phebes backbone.pub>.
+      See README "Clean install".
   when: dromos_phebes_backbone_public_key is not defined
 
 - name: Render backbone WG config (Peleon side)

@@ -12,13 +12,16 @@
   ansible.builtin.shell: |
     set -euo pipefail
     umask 077
-    test -f {{ dromos_secrets_dir }}/server.key || {
-      wg genkey | tee {{ dromos_secrets_dir }}/server.key | wg pubkey > {{ dromos_secrets_dir }}/server.pub
-    }
-    test -f {{ dromos_secrets_dir }}/backbone.key || {
-      wg genkey | tee {{ dromos_secrets_dir }}/backbone.key | wg pubkey > {{ dromos_secrets_dir }}/backbone.pub
-    }
+    if [ ! -f "{{ dromos_secrets_dir }}/server.key" ]; then
+      wg genkey | tee "{{ dromos_secrets_dir }}/server.key" \
+        | wg pubkey > "{{ dromos_secrets_dir }}/server.pub"
+    fi
+    if [ ! -f "{{ dromos_secrets_dir }}/backbone.key" ]; then
+      wg genkey | tee "{{ dromos_secrets_dir }}/backbone.key" \
+        | wg pubkey > "{{ dromos_secrets_dir }}/backbone.pub"
+    fi
   args:
+    executable: /bin/bash
     creates: "{{ dromos_secrets_dir }}/server.pub"
 
 - name: Slurp server private key
@@ -54,6 +57,32 @@
     group: root
     mode: "0600"
   notify: reload dromos-client
+
+# Resolve Peleon's backbone public key. Order of preference:
+#   1. an explicit inventory / -e override (dromos_peleon_public_key)
+#   2. the fact published by bootstrap.yml on the Peleon host (site.yml run)
+# This lets `site.yml` work on a clean install while a standalone `phebes.yml`
+# run still works when the operator passes the key in.
+- name: Resolve Peleon backbone public key
+  ansible.builtin.set_fact:
+    dromos_peleon_public_key: >-
+      {{ dromos_peleon_public_key
+         if dromos_peleon_public_key is defined
+         else hostvars[groups['peleon'][0]].dromos_backbone_public_key }}
+  when: >-
+    dromos_peleon_public_key is defined
+    or (groups['peleon'] is defined
+        and groups['peleon'] | length > 0
+        and hostvars[groups['peleon'][0]].dromos_backbone_public_key is defined)
+
+- name: Require Peleon backbone public key
+  ansible.builtin.fail:
+    msg: >-
+      dromos_peleon_public_key is not set. Run the full site.yml (which
+      bootstraps and exchanges both backbone public keys automatically), or pass
+      it explicitly: -e dromos_peleon_public_key=<peleon backbone.pub>.
+      See README "Clean install".
+  when: dromos_peleon_public_key is not defined
 
 - name: Render backbone WireGuard config (Phebes side)
   ansible.builtin.template:
