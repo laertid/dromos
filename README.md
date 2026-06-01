@@ -77,8 +77,14 @@ cd tests/lab
 
 # 2. Provision both VPS nodes (Ubuntu 22.04+) in one clean install
 ansible-galaxy collection install -r ansible/requirements.yml   # one-time deps
-cp ansible/inventory/sample.ini ansible/inventory/prod.ini
-$EDITOR ansible/inventory/prod.ini   # set ansible_host for both nodes + dromos_peleon_host
+
+# Build the inventory.  Easiest: run the interactive helper, which asks for the
+# two node IPs + the Phebes DNS endpoint and writes ansible/inventory/prod.ini.
+# It won't overwrite an existing prod.ini unless you confirm (or pass --force).
+scripts/dromos-init-inventory
+# (or by hand: cp ansible/inventory/sample.ini ansible/inventory/prod.ini and edit
+#  ansible_host for both nodes, dromos_phebes_endpoint, and dromos_peleon_host)
+
 # Run from the repo root: the ansible.cfg there points roles_path at ansible/roles.
 ansible-playbook -i ansible/inventory/prod.ini ansible/playbooks/site.yml
 
