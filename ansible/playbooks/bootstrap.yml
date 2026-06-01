@@ -54,6 +54,24 @@
         src: "{{ dromos_secrets_dir }}/backbone.pub"
       register: _backbone_pub
 
+    # A WireGuard public key is a base64-encoded 32-byte value: 43 base64
+    # characters plus one '=' pad. If backbone.pub is empty/truncated (a fresh
+    # or half-written file, a failed keygen) the fact would otherwise be
+    # published as an empty string, which silently renders `PublicKey =` and
+    # makes wg-quick fail later with "Line unrecognized: PublicKey=". Validate
+    # here so the run aborts at the source instead of on the remote host.
+    - name: Validate backbone public key before publishing
+      ansible.builtin.assert:
+        that:
+          - (_backbone_pub.content | b64decode | trim) is match('^[A-Za-z0-9+/]{43}=$')
+        fail_msg: >-
+          {{ dromos_secrets_dir }}/backbone.pub on {{ inventory_hostname }} does
+          not contain a valid WireGuard public key (expected 44-char base64).
+          Got: '{{ _backbone_pub.content | b64decode | trim }}'. Delete the
+          stale backbone.key/backbone.pub pair on this host and re-run so the
+          keypair is regenerated.
+        quiet: true
+
     - name: Publish backbone public key as a host fact
       ansible.builtin.set_fact:
         dromos_backbone_public_key: "{{ _backbone_pub.content | b64decode | trim }}"

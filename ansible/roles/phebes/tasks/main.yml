@@ -63,26 +63,37 @@
 #   2. the fact published by bootstrap.yml on the Peleon host (site.yml run)
 # This lets `site.yml` work on a clean install while a standalone `phebes.yml`
 # run still works when the operator passes the key in.
+#
+# Guard on a *non-empty* value, not merely `is defined`: bootstrap publishes the
+# fact from backbone.pub, and a fresh/empty/truncated file yields an empty
+# string that is technically "defined". Resolving that empty value would render
+# `PublicKey =` and make wg-quick fail with "Line unrecognized: PublicKey=".
 - name: Resolve Peleon backbone public key
   ansible.builtin.set_fact:
     dromos_peleon_public_key: >-
       {{ dromos_peleon_public_key
-         if dromos_peleon_public_key is defined
-         else hostvars[groups['peleon'][0]].dromos_backbone_public_key }}
+         if (dromos_peleon_public_key | default('') | trim) | length > 0
+         else hostvars[groups['peleon'][0]].dromos_backbone_public_key | default('') | trim }}
   when: >-
-    dromos_peleon_public_key is defined
+    (dromos_peleon_public_key | default('') | trim) | length > 0
     or (groups['peleon'] is defined
         and groups['peleon'] | length > 0
-        and hostvars[groups['peleon'][0]].dromos_backbone_public_key is defined)
+        and (hostvars[groups['peleon'][0]].dromos_backbone_public_key | default('') | trim) | length > 0)
 
-- name: Require Peleon backbone public key
-  ansible.builtin.fail:
-    msg: >-
-      dromos_peleon_public_key is not set. Run the full site.yml (which
-      bootstraps and exchanges both backbone public keys automatically), or pass
-      it explicitly: -e dromos_peleon_public_key=<peleon backbone.pub>.
+# Fail early, before any template renders, if the key is missing OR present but
+# not a valid WireGuard public key (44-char base64: 43 chars + '=' pad).
+- name: Validate Peleon backbone public key
+  ansible.builtin.assert:
+    that:
+      - (dromos_peleon_public_key | default('') | trim) is match('^[A-Za-z0-9+/]{43}=$')
+    fail_msg: >-
+      dromos_peleon_public_key is missing or not a valid WireGuard public key
+      (got: '{{ dromos_peleon_public_key | default('') }}'). Run the full
+      site.yml (which bootstraps and exchanges both backbone public keys
+      automatically), or pass it explicitly:
+      -e dromos_peleon_public_key=<peleon backbone.pub>.
       See README "Clean install".
-  when: dromos_peleon_public_key is not defined
+    quiet: true
 
 - name: Render backbone WireGuard config (Phebes side)
   ansible.builtin.template:
