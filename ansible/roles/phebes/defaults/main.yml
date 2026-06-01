@@ -15,6 +15,11 @@ dromos_backbone_ifname: dromos-backbone
 # auto-detected interface is wrong.
 dromos_egress_ifname: "{{ ansible_default_ipv4.interface | default('eth0') }}"
 dromos_client_listen_port: 51820
+# Client-facing endpoint hostname/IP that generated client configs point at.
+# Set this in inventory (see sample.ini). The placeholder below only exists so a
+# role run without it set does not fail to template; a real deployment MUST
+# override it with the operator's public endpoint.
+dromos_phebes_endpoint: phebes.example.ru
 dromos_backbone_listen_port_phebes: 51821
 dromos_mark_ru: "0x42"
 dromos_mark_foreign: "0x43"
