@@ -1,5 +1,12 @@
 ---
 dromos_client_subnet_v4: 10.66.0.0/24
+# Client-facing server (gateway) address for the dromos-client interface. This
+# MUST be a usable host inside dromos_client_subnet_v4, not the network address
+# (rendering 10.66.0.0/24 as the iface Address is wrong -- it is unreachable).
+# Keep the subnet's prefix length so the iface is a /24, not a /32. dromos-user
+# reserves this .1 for the server and allocates .2+ to clients. If you change
+# dromos_client_subnet_v4, change this to match (first host of that subnet).
+dromos_client_gateway_v4: 10.66.0.1/24
 dromos_client_ifname: dromos-client
 dromos_backbone_ifname: dromos-backbone
 # Egress (NAT) interface. Defaults to the host's auto-detected default-route

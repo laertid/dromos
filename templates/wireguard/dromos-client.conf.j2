@@ -1,8 +1,14 @@
 {# Phebes client-facing WireGuard interface.
    Rendered to /etc/wireguard/dromos-client.conf.
    PostUp/PostDown hand off to dromos-routing.sh, which is idempotent. #}
+{#- Client-facing server address must be a usable host IP, never the subnet
+    network address. dromos_client_gateway_v4 is the host IP for this iface
+    (default 10.66.0.1/24, the first host of dromos_client_subnet_v4). The
+    earlier `Address = {{ dromos_client_subnet_v4 }}` rendered the network
+    address (10.66.0.0/24), which is not a reachable host. User allocation
+    (dromos-user) reserves .1 for the server and hands out .2+ to clients. -#}
 [Interface]
-Address    = {{ dromos_client_subnet_v4 | default('10.66.0.1/24') }}
+Address    = {{ dromos_client_gateway_v4 | default('10.66.0.1/24') }}
 ListenPort = {{ dromos_client_listen_port | default(51820) }}
 PrivateKey = {{ dromos_server_private_key }}
 MTU        = {{ dromos_client_mtu | default(1380) }}
