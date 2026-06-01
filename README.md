@@ -48,7 +48,10 @@ This gives users a Russian IP for Russian services (banking, gov, content geo-lo
 │   ├── operations.md          day-2 ops, user mgmt, backups
 │   ├── troubleshooting.md     diagnosis recipes
 │   └── security.md            threat model, key handling, audit
+├── ansible.cfg                roles_path so playbooks find ansible/roles from repo root
 ├── ansible/
+│   ├── ansible.cfg            same, for running from inside ansible/
+│   ├── requirements.yml       Galaxy collection deps (ansible.posix)
 │   ├── inventory/             sample inventories (no real hosts)
 │   ├── playbooks/             site.yml, phebes.yml, peleon.yml
 │   └── roles/
@@ -72,8 +75,10 @@ cd tests/lab
 ./run.sh
 
 # 2. Provision a fresh Phebes VPS (Ubuntu 22.04+)
+ansible-galaxy collection install -r ansible/requirements.yml   # one-time deps
 cp ansible/inventory/sample.ini ansible/inventory/prod.ini
 $EDITOR ansible/inventory/prod.ini   # fill in phebes_host, peleon_host
+# Run from the repo root: the ansible.cfg there points roles_path at ansible/roles.
 ansible-playbook -i ansible/inventory/prod.ini ansible/playbooks/site.yml
 
 # 3. Add a user
