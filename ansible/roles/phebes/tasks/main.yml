@@ -39,15 +39,35 @@
     dromos_server_private_key: "{{ _server_key.content | b64decode | trim }}"
     dromos_backbone_phebes_private_key: "{{ _backbone_key.content | b64decode | trim }}"
 
+# On a first install /etc/dromos/users.json does not exist yet. Slurping a
+# missing file logged an ignored *fatal* (noise that looked like a real error
+# in deploy logs). Stat first and only slurp when the file is actually present,
+# so a clean install is silent and an existing user list is still honoured.
+- name: Check for existing user list
+  ansible.builtin.stat:
+    path: "{{ dromos_config_dir }}/users.json"
+  register: _users_json_stat
+
 - name: Load existing user list
   ansible.builtin.slurp:
     src: "{{ dromos_config_dir }}/users.json"
   register: _users_json
-  ignore_errors: true
+  when: _users_json_stat.stat.exists
 
 - name: Set fact for users
   ansible.builtin.set_fact:
-    dromos_users: "{{ (_users_json.content | b64decode | from_json).users | default([]) if _users_json is succeeded else [] }}"
+    dromos_users: "{{ (_users_json.content | b64decode | from_json).users | default([]) if (_users_json_stat.stat.exists and _users_json is defined and 'content' in _users_json) else [] }}"
+
+# Open the client + backbone UDP ports in UFW *before* the WG units start, so a
+# live host running `default deny incoming` still accepts client handshakes and
+# the Phebes<->Peleon backbone. Phebes listens on both the client and backbone
+# ports.
+- name: Allow required ports through UFW (Phebes)
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/firewall.yml"
+  vars:
+    dromos_firewall_udp_ports:
+      - "{{ dromos_client_listen_port | default(51820) }}"
+      - "{{ dromos_backbone_listen_port_phebes | default(51821) }}"
 
 - name: Render client-facing WireGuard config
   ansible.builtin.template:

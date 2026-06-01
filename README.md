@@ -31,7 +31,7 @@ This gives users a Russian IP for Russian services (banking, gov, content geo-lo
 ## Design principles
 
 1. **No host disruption.** Dromos uses dedicated interface names (`dromos-client`, `dromos-backbone`), dedicated routing tables (`100`, `101`), dedicated nftables tables (`inet dromos`), and dedicated packet marks (`0x42`, `0x43`). It never touches the host default route, the host SSH config, host sysctl outside of the namespaced flags it needs, or any existing nftables tables.
-2. **SSH is sacred.** No playbook flushes nftables, runs `ufw reset`, or otherwise risks locking us out. All firewall changes are additive into Dromos-owned chains.
+2. **SSH is sacred.** No playbook flushes nftables, runs `ufw reset`, or otherwise risks locking us out. All firewall changes are additive: into Dromos-owned nftables chains, and — when UFW is the active host firewall — only `ufw allow` rules for the WireGuard ports (and SSH is re-asserted alongside them so opening ports can never sever the session).
 3. **IPv4 only in v1.** IPv6 is disabled on Dromos interfaces to avoid leaks. v2 may add v6 once we have a v6 geobase strategy.
 4. **Idempotent.** Every script and Ansible task can be re-run safely.
 5. **Easy to recreate Phebes.** See [docs/rebuild-phebes.md](docs/rebuild-phebes.md). New VPS, run installer, restore creds, update DNS, ~10 min downtime.

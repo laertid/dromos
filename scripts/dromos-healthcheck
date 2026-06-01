@@ -1,14 +1,44 @@
 #!/bin/bash
 # dromos-healthcheck -- single-shot health probe.  Exit 0 on all green.
 #
+# Role-aware. Phebes (entry node) runs the full client + policy-routing + geo
+# checks. Peleon (exit node) has no dromos-client, no RU ipset, and no fwmark
+# policy routing -- it only terminates the backbone and NATs out its egress --
+# so running the Phebes checks there produced misleading [FAIL]s (client
+# missing, ipset empty, ip-rule missing). On Peleon we check only what Peleon
+# actually owns: the backbone handshake, the nft NAT table, and egress.
+#
+# Role resolution order:
+#   1. --role {peleon|phebes}             (CLI)
+#   2. $DROMOS_ROLE                       (env, e.g. from /etc/dromos/routing.env)
+#   3. /etc/dromos/routing.env            (sourced if present)
+#   4. auto-detect: dromos-client present -> phebes, else -> peleon
+#
 set -uo pipefail
 
+# Source the Ansible-rendered runtime env (carries DROMOS_ROLE, DROMOS_EGRESS_IF)
+# if present, without overriding anything already set in the environment.
+DROMOS_ROUTING_ENV=${DROMOS_ROUTING_ENV:-/etc/dromos/routing.env}
+if [[ -r "$DROMOS_ROUTING_ENV" ]]; then
+    _saved_role=${DROMOS_ROLE:-}
+    # shellcheck source=/dev/null
+    . "$DROMOS_ROUTING_ENV"
+    [[ -n "$_saved_role" ]] && DROMOS_ROLE=$_saved_role
+fi
+
 VERBOSE=0
-[[ "${1:-}" == "--verbose" || "${1:-}" == "-v" ]] && VERBOSE=1
+ROLE=${DROMOS_ROLE:-}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --verbose|-v) VERBOSE=1; shift ;;
+        --role)       ROLE=${2:-}; shift 2 ;;
+        --role=*)     ROLE=${1#*=}; shift ;;
+        *)            shift ;;
+    esac
+done
 
 CLIENT_IF=${DROMOS_CLIENT_IF:-dromos-client}
 BACKBONE_IF=${DROMOS_BACKBONE_IF:-dromos-backbone}
-PEER_ADDR=${DROMOS_PELEON_BACKBONE_ADDR:-10.77.0.2}
 NFT_TABLE=${DROMOS_NFT_TABLE:-dromos}
 RU_SET=${DROMOS_RU_SET:-dromos_ru4}
 MARK_RU=${DROMOS_MARK_RU:-0x42}
@@ -16,20 +46,33 @@ MARK_FOREIGN=${DROMOS_MARK_FOREIGN:-0x43}
 TABLE_RU=${DROMOS_TABLE_RU:-100}
 TABLE_FOREIGN=${DROMOS_TABLE_FOREIGN:-101}
 CACHE_DIR=${DROMOS_CACHE_DIR:-/var/cache/dromos}
+EGRESS_IF=${DROMOS_EGRESS_IF:-}
+
+# Auto-detect role if still unknown: Phebes is the only host with dromos-client.
+if [[ -z "$ROLE" ]]; then
+    if ip link show "$CLIENT_IF" >/dev/null 2>&1; then
+        ROLE=phebes
+    else
+        ROLE=peleon
+    fi
+fi
+
+# Backbone peer to ping: from Phebes that's Peleon (10.77.0.2); from Peleon
+# that's Phebes (10.77.0.1). Honour an explicit override either way.
+if [[ "$ROLE" == "peleon" ]]; then
+    PEER_ADDR=${DROMOS_PEER_BACKBONE_ADDR:-${DROMOS_PHEBES_BACKBONE_ADDR:-10.77.0.1}}
+else
+    PEER_ADDR=${DROMOS_PEER_BACKBONE_ADDR:-${DROMOS_PELEON_BACKBONE_ADDR:-10.77.0.2}}
+fi
 
 fails=0
 ok()   { printf '[OK]   %s\n' "$*"; }
 fail() { printf '[FAIL] %s\n' "$*"; fails=$((fails+1)); }
 warn() { printf '[WARN] %s\n' "$*"; }
 
-# 1. WG interfaces up
-if ip link show "$CLIENT_IF" 2>/dev/null | grep -q 'state UNKNOWN\|state UP'; then
-    peers=$(wg show "$CLIENT_IF" peers 2>/dev/null | wc -l)
-    ok "$CLIENT_IF up, peers: $peers"
-else
-    fail "$CLIENT_IF down or missing"
-fi
+printf '=== dromos-healthcheck (role: %s) ===\n' "$ROLE"
 
+# --- backbone handshake (both roles) ---------------------------------------
 if ip link show "$BACKBONE_IF" 2>/dev/null | grep -q 'state UNKNOWN\|state UP'; then
     hs=$(wg show "$BACKBONE_IF" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
     if [[ -n "$hs" && "$hs" -gt 0 ]]; then
@@ -43,44 +86,10 @@ if ip link show "$BACKBONE_IF" 2>/dev/null | grep -q 'state UNKNOWN\|state UP'; 
         warn "$BACKBONE_IF has no handshake yet"
     fi
 else
-    fail "$BACKBONE_IF down or missing (skip if running on Peleon-only host)"
+    fail "$BACKBONE_IF down or missing"
 fi
 
-# 2. ipset / nft set
-count=$(nft list set inet "$NFT_TABLE" "$RU_SET" 2>/dev/null | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' || true)
-if (( count > 100 )); then
-    ok "ipset $RU_SET entries: $count"
-else
-    fail "ipset $RU_SET has only $count entries"
-fi
-
-# 3. cache freshness
-if [[ -r "$CACHE_DIR/ipset-ru4.last-update" ]]; then
-    last=$(cat "$CACHE_DIR/ipset-ru4.last-update")
-    last_ts=$(date -d "$last" +%s 2>/dev/null || echo 0)
-    age_d=$(( ($(date +%s) - last_ts) / 86400 ))
-    if (( age_d < 14 )); then
-        ok "geobase cache age: ${age_d}d"
-    else
-        warn "geobase cache age: ${age_d}d (>= 14d)"
-    fi
-else
-    warn "no geobase cache timestamp"
-fi
-
-# 4. ip rule entries
-if ip rule show | grep -q "fwmark $MARK_RU lookup $TABLE_RU"; then
-    ok "ip rule fwmark $MARK_RU -> $TABLE_RU present"
-else
-    fail "ip rule fwmark $MARK_RU -> $TABLE_RU missing"
-fi
-if ip rule show | grep -q "fwmark $MARK_FOREIGN lookup $TABLE_FOREIGN"; then
-    ok "ip rule fwmark $MARK_FOREIGN -> $TABLE_FOREIGN present"
-else
-    fail "ip rule fwmark $MARK_FOREIGN -> $TABLE_FOREIGN missing"
-fi
-
-# 5. nft table present
+# --- nft table present (both roles) ----------------------------------------
 chains=$(nft list table inet "$NFT_TABLE" 2>/dev/null | grep -c '^[[:space:]]*chain ' || true)
 if (( chains >= 4 )); then
     ok "nftables table inet $NFT_TABLE present, $chains chains"
@@ -88,7 +97,23 @@ else
     fail "nftables table inet $NFT_TABLE missing or incomplete ($chains chains)"
 fi
 
-# 6. backbone ping
+# --- egress interface present (both roles; Peleon NATs everything out it) ---
+if [[ -n "$EGRESS_IF" ]]; then
+    if ip link show "$EGRESS_IF" >/dev/null 2>&1; then
+        ok "egress interface $EGRESS_IF present"
+    else
+        fail "egress interface $EGRESS_IF missing"
+    fi
+else
+    det=$(ip route show default 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    if [[ -n "$det" ]]; then
+        ok "egress interface (default route): $det"
+    else
+        warn "no default route / egress interface detected"
+    fi
+fi
+
+# --- backbone ping (both roles) --------------------------------------------
 if ping -c1 -W2 -I "$BACKBONE_IF" "$PEER_ADDR" >/dev/null 2>&1; then
     rtt=$(ping -c1 -W2 -I "$BACKBONE_IF" "$PEER_ADDR" 2>/dev/null | awk -F'time=' '/time=/{print $2; exit}' | awk '{print $1}')
     ok "ping $PEER_ADDR via $BACKBONE_IF: ${rtt}ms"
@@ -96,14 +121,61 @@ else
     fail "ping $PEER_ADDR via $BACKBONE_IF failed"
 fi
 
+# --- Phebes-only checks: client iface, RU ipset, geo cache, policy routing --
+if [[ "$ROLE" == "phebes" ]]; then
+    # client interface up
+    if ip link show "$CLIENT_IF" 2>/dev/null | grep -q 'state UNKNOWN\|state UP'; then
+        peers=$(wg show "$CLIENT_IF" peers 2>/dev/null | wc -l)
+        ok "$CLIENT_IF up, peers: $peers"
+    else
+        fail "$CLIENT_IF down or missing"
+    fi
+
+    # RU ipset / nft set
+    count=$(nft list set inet "$NFT_TABLE" "$RU_SET" 2>/dev/null | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' || true)
+    if (( count > 100 )); then
+        ok "ipset $RU_SET entries: $count"
+    else
+        fail "ipset $RU_SET has only $count entries"
+    fi
+
+    # geobase cache freshness
+    if [[ -r "$CACHE_DIR/ipset-ru4.last-update" ]]; then
+        last=$(cat "$CACHE_DIR/ipset-ru4.last-update")
+        last_ts=$(date -d "$last" +%s 2>/dev/null || echo 0)
+        age_d=$(( ($(date +%s) - last_ts) / 86400 ))
+        if (( age_d < 14 )); then
+            ok "geobase cache age: ${age_d}d"
+        else
+            warn "geobase cache age: ${age_d}d (>= 14d)"
+        fi
+    else
+        warn "no geobase cache timestamp"
+    fi
+
+    # fwmark policy-routing rules
+    if ip rule show | grep -q "fwmark $MARK_RU lookup $TABLE_RU"; then
+        ok "ip rule fwmark $MARK_RU -> $TABLE_RU present"
+    else
+        fail "ip rule fwmark $MARK_RU -> $TABLE_RU missing"
+    fi
+    if ip rule show | grep -q "fwmark $MARK_FOREIGN lookup $TABLE_FOREIGN"; then
+        ok "ip rule fwmark $MARK_FOREIGN -> $TABLE_FOREIGN present"
+    else
+        fail "ip rule fwmark $MARK_FOREIGN -> $TABLE_FOREIGN missing"
+    fi
+fi
+
 if (( VERBOSE )); then
     echo "---"
     wg show 2>/dev/null || true
-    ip -d link show "$CLIENT_IF" 2>/dev/null || true
+    [[ "$ROLE" == "phebes" ]] && ip -d link show "$CLIENT_IF" 2>/dev/null || true
     ip -d link show "$BACKBONE_IF" 2>/dev/null || true
     ip rule show
-    ip route show table "$TABLE_RU" 2>/dev/null
-    ip route show table "$TABLE_FOREIGN" 2>/dev/null
+    if [[ "$ROLE" == "phebes" ]]; then
+        ip route show table "$TABLE_RU" 2>/dev/null
+        ip route show table "$TABLE_FOREIGN" 2>/dev/null
+    fi
 fi
 
 exit $(( fails > 0 ))

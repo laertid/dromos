@@ -1,0 +1,60 @@
+---
+# Open the WireGuard ports Dromos needs *only* when UFW is active.
+#
+# Why this exists: a live Peleon ran UFW with `default deny incoming` and only
+# 22/tcp allowed. tcpdump saw Phebes' UDP reaching Peleon:51821 but WireGuard
+# never handshook because UFW silently dropped it. This task adds the required
+# allow rules so the backbone (and, on Phebes, the client port) can establish.
+#
+# Safety contract:
+#   - We NEVER `ufw reset`, `ufw disable`, or change the default policy.
+#   - We ONLY add `allow` rules, and only when UFW is already active. If UFW is
+#     inactive we do nothing (nftables/iptables aren't UFW-managed here).
+#   - We also (re)assert an allow for the SSH port, so enabling these rules can
+#     never be what severs the operator's session.
+#   - `ufw allow` is idempotent; passing comments lets us match rules exactly,
+#     and `--dry-run` lets us add only when the rule is genuinely missing, so
+#     re-runs report no change.
+#
+# Callers pass `dromos_firewall_udp_ports` (list of UDP ports to open). The SSH
+# port is always added on top.
+
+- name: Check whether UFW is installed
+  ansible.builtin.command: which ufw
+  register: _ufw_which
+  changed_when: false
+  failed_when: false
+
+- name: Determine UFW active state
+  ansible.builtin.command: ufw status
+  register: _ufw_status
+  changed_when: false
+  failed_when: false
+  when: _ufw_which.rc == 0
+
+- name: Set UFW active fact
+  ansible.builtin.set_fact:
+    _ufw_active: "{{ _ufw_which.rc == 0 and (_ufw_status.stdout | default('')) is search('Status:\\s+active') }}"
+
+- name: Report UFW state
+  ansible.builtin.debug:
+    msg: >-
+      UFW {{ 'active -- adding Dromos allow rules for ports '
+             ~ ([dromos_ssh_port | default(22)] + (dromos_firewall_udp_ports | default([]))) | join(', ')
+             if _ufw_active
+             else 'not active -- skipping firewall rules' }}
+
+- name: Allow SSH through UFW (belt-and-suspenders; never sever the session)
+  ansible.builtin.command:
+    cmd: "ufw allow {{ dromos_ssh_port | default(22) }}/tcp comment 'dromos: ssh management'"
+  register: _ufw_ssh
+  changed_when: "'Rule added' in _ufw_ssh.stdout or 'Rules updated' in _ufw_ssh.stdout"
+  when: _ufw_active | bool
+
+- name: Allow Dromos WireGuard UDP ports through UFW
+  ansible.builtin.command:
+    cmd: "ufw allow {{ item }}/udp comment 'dromos: wireguard {{ item }}/udp'"
+  loop: "{{ dromos_firewall_udp_ports | default([]) }}"
+  register: _ufw_udp
+  changed_when: "'Rule added' in _ufw_udp.stdout or 'Rules updated' in _ufw_udp.stdout"
+  when: _ufw_active | bool

@@ -60,13 +60,21 @@ The server retains client `priv` files only to print/QR them later. Operator bac
 | Host    | Port      | Proto | Audience                |
 |---------|-----------|-------|-------------------------|
 | Phebes  | 22        | TCP   | operator only (you)     |
-| Phebes  | 51820     | UDP   | clients                 |
+| Phebes  | 51820     | UDP   | clients (WG)            |
+| Phebes  | 51821     | UDP   | backbone (to Peleon)    |
 | Phebes  | 8388      | TCP   | clients (SS)            |
 | Phebes  | 443       | TCP   | clients (OVPN)          |
 | Peleon  | 22        | TCP   | operator only (you)     |
 | Peleon  | 51821     | UDP   | only Phebes (firewall)  |
 
 Peleon's `51821/udp` is rate-limited and only accepts packets from Phebes's public IP. This is enforced by a Dromos nftables rule, not by trusting the WG handshake alone.
+
+When UFW is the active host firewall, the Dromos roles additively `ufw allow`
+the WireGuard UDP ports above (Peleon `51821`; Phebes `51820`+`51821`) and
+re-assert the SSH port — they never reset UFW or change its default policy.
+Without this, a `default deny incoming` UFW silently drops the inbound WG UDP
+and the backbone never handshakes (see
+[docs/troubleshooting.md](troubleshooting.md#backbone-never-handshakes-ufw-silently-drops-the-wg-port)).
 
 ## Logging
 

@@ -57,6 +57,15 @@
       See README "Clean install".
     quiet: true
 
+# Open the backbone UDP port in UFW *before* the WG unit starts, so a live host
+# running `default deny incoming` (only 22/tcp allowed) still completes the
+# Phebes<->Peleon handshake. Peleon only needs its backbone listen port.
+- name: Allow required ports through UFW (Peleon)
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/firewall.yml"
+  vars:
+    dromos_firewall_udp_ports:
+      - "{{ dromos_backbone_listen_port_peleon | default(51821) }}"
+
 - name: Render backbone WG config (Peleon side)
   ansible.builtin.template:
     src: "{{ playbook_dir }}/../../templates/wireguard/dromos-backbone-peleon.conf.j2"
