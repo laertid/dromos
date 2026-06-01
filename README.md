@@ -53,6 +53,7 @@ This gives users a Russian IP for Russian services (banking, gov, content geo-lo
 │   ├── ansible.cfg            same, for running from inside ansible/
 │   ├── requirements.yml       Galaxy collection deps (ansible.posix)
 │   ├── inventory/             sample inventories (no real hosts)
+│   │   └── group_vars/all.yml shared paths (config/secrets/cache dirs)
 │   ├── playbooks/             site.yml, bootstrap.yml, phebes.yml, peleon.yml
 │   └── roles/
 │       ├── common/            sysctl, packages, dromos user

@@ -25,6 +25,26 @@ custom task, add the same:
     executable: /bin/bash
 ```
 
+### `'dromos_secrets_dir' is undefined` in bootstrap.yml
+
+Symptom (during `ansible-playbook ... site.yml`, on a clean install):
+
+```
+TASK [Ensure secrets directory exists]
+fatal: [...]: FAILED! => "'dromos_secrets_dir' is undefined"
+```
+
+Cause: `bootstrap.yml` runs with `roles:` unset, so it never loads the `common`
+role's `defaults/main.yml` where the directory paths used to live. The role
+plays (`phebes.yml` / `peleon.yml`) saw the variable, but the role-less
+bootstrap play did not.
+
+Fixed in this repo: the shared paths (`dromos_config_dir`, `dromos_secrets_dir`,
+`dromos_cache_dir`) now live in `ansible/inventory/group_vars/all.yml`, which
+Ansible auto-loads for *every* play in the run — bootstrap included. If you keep
+a custom inventory elsewhere, make sure a sibling `group_vars/all.yml` defines
+these, or pass them with `-e`.
+
 ### `AnsibleUndefinedVariable: 'dromos_peleon_public_key' is undefined`
 
 (or the symmetric `dromos_phebes_backbone_public_key is undefined`)
