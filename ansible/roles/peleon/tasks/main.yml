@@ -65,6 +65,10 @@
   vars:
     dromos_firewall_udp_ports:
       - "{{ dromos_backbone_listen_port_peleon | default(51821) }}"
+    # Peleon is the exit node: also allow forwarding from the backbone out the
+    # egress interface, or UFW's routed-deny policy drops client traffic.
+    dromos_firewall_route_in_ifname: "{{ dromos_backbone_ifname | default('dromos-backbone') }}"
+    dromos_firewall_route_out_ifname: "{{ dromos_egress_ifname | default(ansible_default_ipv4.interface) | default('eth0') }}"
 
 - name: Render backbone WG config (Peleon side)
   ansible.builtin.template:

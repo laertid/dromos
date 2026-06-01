@@ -2,7 +2,7 @@
 [Interface]
 PrivateKey = {{ user.private_key }}
 Address    = {{ user.address }}/32
-DNS        = {{ dromos_client_dns | default('10.66.0.1') }}
+DNS        = {{ dromos_client_dns | default('1.1.1.1, 1.0.0.1') }}
 MTU        = {{ dromos_client_mtu | default(1380) }}
 
 [Peer]
