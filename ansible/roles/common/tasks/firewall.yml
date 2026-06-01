@@ -18,6 +18,16 @@
 #
 # Callers pass `dromos_firewall_udp_ports` (list of UDP ports to open). The SSH
 # port is always added on top.
+#
+# Callers that need forwarding (Peleon, the exit node) also pass
+# `dromos_firewall_route_in_ifname` + `dromos_firewall_route_out_ifname`. With
+# UFW's default routed policy at `deny`, allowing the backbone UDP port lets the
+# WireGuard handshake complete but forwarded client traffic decapsulated out of
+# dromos-backbone is still dropped on the FORWARD path. A live Peleon showed
+# exactly this: the tunnel was up and Phebes sent MB to Peleon, but almost
+# nothing came back. `ufw route allow in on <backbone> out on <egress>` adds the
+# `ufw-user-forward` ACCEPT that lets that traffic egress. We only add it when
+# both interface names are provided, so Phebes (no forwarding) skips it.
 
 - name: Check whether UFW is installed
   ansible.builtin.command: which ufw
@@ -58,3 +68,20 @@
   register: _ufw_udp
   changed_when: "'Rule added' in _ufw_udp.stdout or 'Rules updated' in _ufw_udp.stdout"
   when: _ufw_active | bool
+
+# Forwarding allow: backbone -> egress. Required on the exit node so decapsulated
+# client traffic survives UFW's routed FORWARD policy (default deny). `ufw route
+# allow` is idempotent (re-adding reports "Skipping adding existing rule"); the
+# comment lets the rule be matched/audited later.
+- name: Allow Dromos forwarding (backbone -> egress) through UFW route policy
+  ansible.builtin.command:
+    cmd: >-
+      ufw route allow in on {{ dromos_firewall_route_in_ifname }}
+      out on {{ dromos_firewall_route_out_ifname }}
+      comment 'dromos: backbone to internet'
+  register: _ufw_route
+  changed_when: "'Rule added' in _ufw_route.stdout or 'Rules updated' in _ufw_route.stdout"
+  when:
+    - _ufw_active | bool
+    - (dromos_firewall_route_in_ifname | default('')) | length > 0
+    - (dromos_firewall_route_out_ifname | default('')) | length > 0

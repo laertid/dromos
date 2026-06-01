@@ -213,6 +213,7 @@
       # Managed by Ansible (dromos phebes role). Do not edit by hand.
       DROMOS_PHEBES_ENDPOINT={{ dromos_phebes_endpoint }}
       DROMOS_CLIENT_LISTEN_PORT={{ dromos_client_listen_port | default(51820) }}
+      DROMOS_CLIENT_DNS={{ dromos_client_dns | default('1.1.1.1, 1.0.0.1') }}
 
 - name: Install dromos-user CLI
   ansible.builtin.copy:

@@ -56,6 +56,45 @@ def test_client_facing_wg_address_honours_explicit_gateway(env):
     assert "Address    = 10.66.0.0/24" not in out
 
 
+def test_per_user_client_dns_defaults_to_public_resolvers(env):
+    """Phebes runs no resolver, so the per-user client template must default
+    DNS to public resolvers -- never the tunnel gateway 10.66.0.1, which made
+    every lookup fail on a live deployment."""
+    tpl = env.get_template("wireguard/client.conf.j2")
+    out = tpl.render(
+        user={"private_key": "K", "address": "10.66.0.2", "preshared_key": "P"},
+        dromos_server_public_key="SPUB",
+        dromos_phebes_endpoint="phebes.example.ru",
+    )
+    assert "DNS        = 1.1.1.1, 1.0.0.1" in out
+    assert "DNS        = 10.66.0.1" not in out
+
+
+def test_per_user_client_dns_honours_override(env):
+    tpl = env.get_template("wireguard/client.conf.j2")
+    out = tpl.render(
+        user={"private_key": "K", "address": "10.66.0.2", "preshared_key": "P"},
+        dromos_server_public_key="SPUB",
+        dromos_phebes_endpoint="phebes.example.ru",
+        dromos_client_dns="9.9.9.9",
+    )
+    assert "DNS        = 9.9.9.9" in out
+
+
+def test_openvpn_dns_pushes_one_per_resolver(env):
+    """OpenVPN needs one `push dhcp-option DNS` per resolver; a comma list must
+    be split, and the default must be public resolvers, not 10.66.0.1."""
+    tpl = env.get_template("openvpn/server.conf.j2")
+    out = tpl.render()
+    assert 'push "dhcp-option DNS 1.1.1.1"' in out
+    assert 'push "dhcp-option DNS 1.0.0.1"' in out
+    assert 'push "dhcp-option DNS 10.66.0.1"' not in out
+
+    out2 = tpl.render(dromos_client_dns="9.9.9.9, 149.112.112.112")
+    assert 'push "dhcp-option DNS 9.9.9.9"' in out2
+    assert 'push "dhcp-option DNS 149.112.112.112"' in out2
+
+
 def test_backbone_phebes_renders(env):
     tpl = env.get_template("wireguard/dromos-backbone-phebes.conf.j2")
     out = tpl.render(

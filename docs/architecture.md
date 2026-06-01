@@ -86,7 +86,7 @@ For `dst = 87.250.250.242` (yandex.ru, in `dromos_ru4`):
 
 - UDP/51820 on Phebes public IP.
 - One peer per user. Public key in server config, private key only on client and in operator backup.
-- AllowedIPs on client: `0.0.0.0/0` (full tunnel). DNS pushed: `10.66.0.1` (Phebes runs a tiny dnsmasq stub or forwards to upstream).
+- AllowedIPs on client: `0.0.0.0/0` (full tunnel). DNS handed to clients: public resolvers (`1.1.1.1, 1.0.0.1` by default, via `dromos_client_dns`). Phebes runs no resolver, so DNS queries ride the full tunnel and exit through Dromos/Peleon like any other foreign traffic.
 - MTU: 1380 (safe for double WG encap).
 
 ### Shadowsocks (secondary)

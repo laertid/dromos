@@ -139,6 +139,12 @@ dromos_table_foreign = 101
 dromos_phebes_endpoint = $phebes_endpoint
 dromos_peleon_host     = $peleon_ip
 
+; -- client DNS -------------------------------------------------------------
+; DNS handed to clients. Phebes runs NO resolver; public resolvers route through
+; the full tunnel. Comma-separated list is fine. After changing this, existing
+; users must regenerate or hand-edit their configs.
+dromos_client_dns = 1.1.1.1, 1.0.0.1
+
 ; -- geo --------------------------------------------------------------------
 dromos_geo_url = https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone
 EOF

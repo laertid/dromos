@@ -187,6 +187,46 @@ def test_endpoint_and_port_read_from_client_env(lab, monkeypatch):
     assert "phebes.example.ru" not in conf
 
 
+def test_client_dns_defaults_to_public_resolvers(lab, monkeypatch):
+    """With no DNS override anywhere, dromos-user must render public resolvers,
+    never the tunnel gateway 10.66.0.1 (Phebes runs no resolver)."""
+    sys.modules.pop("dromos_user_mod", None)
+    monkeypatch.delenv("DROMOS_CLIENT_DNS", raising=False)
+    du = load_user_module(lab)
+    assert du.DNS == "1.1.1.1, 1.0.0.1"
+
+    class A: pass
+    a = A(); a.name = "ivy"
+    du.cmd_add(a)
+    conf = du.render_client_conf(du.load_users()["users"][0])
+    assert "DNS        = 1.1.1.1, 1.0.0.1" in conf
+    assert "10.66.0.1" not in conf
+
+
+def test_client_dns_read_from_client_env(lab, monkeypatch):
+    """Ansible writes DROMOS_CLIENT_DNS into client.env; dromos-user must use it."""
+    sys.modules.pop("dromos_user_mod", None)
+    monkeypatch.delenv("DROMOS_CLIENT_DNS", raising=False)
+    client_env = Path(lab["DROMOS_CONFIG_DIR"]) / "client.env"
+    client_env.write_text("DROMOS_CLIENT_DNS=8.8.8.8, 8.8.4.4\n")
+    env = dict(lab)
+    env["DROMOS_CLIENT_ENV"] = str(client_env)
+    du = load_user_module(env)
+    assert du.DNS == "8.8.8.8, 8.8.4.4"
+
+
+def test_client_dns_env_overrides_client_env(lab, monkeypatch):
+    """An explicit DROMOS_CLIENT_DNS env var wins over the file."""
+    sys.modules.pop("dromos_user_mod", None)
+    client_env = Path(lab["DROMOS_CONFIG_DIR"]) / "client.env"
+    client_env.write_text("DROMOS_CLIENT_DNS=8.8.8.8\n")
+    env = dict(lab)
+    env["DROMOS_CLIENT_ENV"] = str(client_env)
+    env["DROMOS_CLIENT_DNS"] = "9.9.9.9"
+    du = load_user_module(env)
+    assert du.DNS == "9.9.9.9"
+
+
 def test_real_env_overrides_client_env(lab, monkeypatch):
     """An explicit DROMOS_PHEBES_ENDPOINT env var still wins over the file."""
     sys.modules.pop("dromos_user_mod", None)

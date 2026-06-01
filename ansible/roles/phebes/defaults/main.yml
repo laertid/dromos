@@ -35,7 +35,13 @@ dromos_deadman_minutes: 5
 dromos_table_ru: 100
 dromos_table_foreign: 101
 dromos_client_mtu: 1380
-dromos_client_dns: 10.66.0.1
+# DNS handed to WireGuard clients. Phebes does NOT run a resolver, so pointing
+# clients at the tunnel gateway (10.66.0.1) made every lookup fail. Use public
+# resolvers instead: their packets enter the full-tunnel WG client and route
+# through Dromos/Peleon like any other foreign traffic. A comma-separated list
+# is valid in a WG `DNS =` line. Override per deployment in inventory; existing
+# users must regenerate (or hand-edit) their configs after changing this.
+dromos_client_dns: "1.1.1.1, 1.0.0.1"
 dromos_ss_port: 8388
 dromos_ss_method: chacha20-ietf-poly1305
 dromos_geo_url: https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone

@@ -13,8 +13,11 @@ tls-crypt /etc/dromos/secrets/openvpn/ta.key
 server 10.68.0.0 255.255.255.0
 topology subnet
 
-# We hand out the same DNS as WG users.
-push "dhcp-option DNS {{ dromos_client_dns | default('10.66.0.1') }}"
+# We hand out the same DNS as WG users. dromos_client_dns may be a comma list
+# (valid for WG); OpenVPN needs one push per resolver, so split it.
+{% for _dns in (dromos_client_dns | default('1.1.1.1, 1.0.0.1')).split(',') if _dns | trim %}
+push "dhcp-option DNS {{ _dns | trim }}"
+{% endfor %}
 push "redirect-gateway def1 bypass-dhcp"
 push "block-outside-dns"
 

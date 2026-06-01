@@ -207,6 +207,34 @@ Three possibilities:
 
    The `accept` rules should be incrementing. If a `drop` rule is incrementing, that's the bug.
 
+4. **UFW is dropping forwarded traffic on Peleon.** If UFW is active with a
+   default-deny *routed* policy, allowing the backbone UDP port lets the tunnel
+   handshake but UFW still drops decapsulated client traffic on the FORWARD
+   path. Symptom: Phebes sends MB to Peleon but receives little back. Check:
+
+   ```bash
+   ufw status verbose | grep -i 'Default:'        # → '... deny (routed)'
+   iptables -S ufw-user-forward                   # should ACCEPT in dromos-backbone out <egress>
+   ```
+
+   The playbook adds this automatically (`ufw route allow in on dromos-backbone
+   out on <egress>`). To apply by hand on a live host:
+
+   ```bash
+   ufw route allow in on dromos-backbone out on enx5 comment 'dromos: backbone to internet'
+   ```
+
+   (replace `enx5` with Peleon's actual egress interface).
+
+## "DNS doesn't resolve but I can reach IPs directly"
+
+Phebes runs **no** DNS resolver. If clients were handed `DNS = 10.66.0.1`
+(the tunnel gateway), every lookup fails while direct IPs still work. Fix by
+setting `dromos_client_dns` to public resolvers (default `1.1.1.1, 1.0.0.1`)
+and re-running the Phebes playbook. **Existing users must regenerate or
+hand-edit their configs** afterward (`dromos-user show <name>` prints the
+updated config); a client holding an old config keeps the old DNS line.
+
 ## "ip rule" entries vanished
 
 A reboot without the systemd unit, or someone ran `ip rule flush`.
