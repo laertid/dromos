@@ -2,7 +2,11 @@
 dromos_client_subnet_v4: 10.66.0.0/24
 dromos_client_ifname: dromos-client
 dromos_backbone_ifname: dromos-backbone
-dromos_egress_ifname: eth0
+# Egress (NAT) interface. Defaults to the host's auto-detected default-route
+# interface from Ansible facts, so it is correct per host (e.g. enx5 on one box,
+# eth0 on another). Override per host or globally in inventory only when the
+# auto-detected interface is wrong.
+dromos_egress_ifname: "{{ ansible_default_ipv4.interface | default('eth0') }}"
 dromos_client_listen_port: 51820
 dromos_backbone_listen_port_phebes: 51821
 dromos_mark_ru: "0x42"

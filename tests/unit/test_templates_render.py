@@ -72,6 +72,25 @@ def test_nftables_renders(env):
     assert "type nat hook postrouting" in out
 
 
+def test_nftables_honours_custom_egress_ifname(env):
+    """Regression: live Peleon's default route is enx5, not eth0. The egress
+    interface must come from the rendered var, not be hardcoded -- otherwise
+    the NAT/forward rules reference the wrong device and egress breaks."""
+    tpl = env.get_template("nftables/dromos.nft.j2")
+    out = tpl.render(dromos_egress_ifname="enx5")
+    assert 'oifname "enx5"' in out
+    # The eth0 default must not leak through once a value is supplied.
+    assert 'oifname "eth0"' not in out
+
+
+def test_nftables_egress_defaults_to_eth0_without_var(env):
+    """When no egress var is passed at all, the template still renders a valid
+    ruleset using the eth0 fallback (the role's last-resort default)."""
+    tpl = env.get_template("nftables/dromos.nft.j2")
+    out = tpl.render()
+    assert '"eth0"' in out
+
+
 def test_shadowsocks_renders_no_password_leak(env):
     tpl = env.get_template("shadowsocks/config.json.j2")
     out = tpl.render(dromos_ss_password="VERY_SECRET")

@@ -152,6 +152,40 @@ ip netns exec dromos-trace ping -c 1 87.250.250.242
 # look for "meta mark set 0x42"
 ```
 
+## Backbone never handshakes (UFW silently drops the WG port)
+
+Symptom: `wg show dromos-backbone` shows no handshake, yet `tcpdump -ni any udp
+port 51821` on the *receiving* host shows the peer's packets arriving. The
+packets reach the NIC but never reach WireGuard.
+
+Cause: a host firewall (commonly UFW with `default deny incoming` and only
+`22/tcp` allowed) drops the inbound WireGuard UDP. This was seen live on Peleon:
+Phebes' UDP reached `Peleon:51821` but UFW dropped it before WireGuard.
+
+```bash
+ufw status verbose            # is it active? what's allowed?
+```
+
+Fix: the Dromos roles now open the required UDP ports **when UFW is active**,
+idempotently and additively (never `ufw reset` / `ufw disable` / policy change),
+re-running is a no-op:
+
+- Peleon: `51821/udp` (backbone)
+- Phebes: `51820/udp` (client) + `51821/udp` (backbone)
+- SSH (`dromos_ssh_port`, default `22/tcp`) is re-asserted on both so opening
+  these rules can never sever your session.
+
+Re-run the relevant play (`site.yml`, or `peleon.yml`/`phebes.yml`) and the
+allow rules appear. To verify manually:
+
+```bash
+ufw status | grep -E '5182[01]/udp'
+```
+
+If you manage the firewall some other way (raw nftables/iptables, cloud
+security groups), open the same ports there — Dromos only manages UFW when UFW
+is the active firewall.
+
 ## "Foreign sites don't load at all"
 
 Three possibilities:
@@ -248,6 +282,36 @@ Dromos never touches the `inet filter` / `ip filter` tables or SSH config, so a
 
 If you truly can't recover via console: snapshot the disk, rebuild Phebes from
 scratch, restore from backup.
+
+## Egress / NAT goes out the wrong interface (not eth0)
+
+Symptom: clients can reach the backbone but RU-direct exit (Phebes) or all
+exit traffic (Peleon) fails, and the rendered nft rules reference `eth0` while
+the host's real uplink is something else (live Peleon's default route was
+`enx5`).
+
+Dromos no longer hardcodes `eth0`. `dromos_egress_ifname` now defaults per host
+to `ansible_default_ipv4.interface` (the auto-detected default-route device),
+and the generated inventory leaves it **unset** so each host detects its own.
+
+Check what was detected/rendered:
+
+```bash
+ip route show default                     # the real egress device
+cat /etc/dromos/routing.env               # DROMOS_EGRESS_IF used at runtime
+grep -E 'oifname' /etc/dromos/dromos.nft  # device in the NAT/forward rules
+```
+
+If auto-detection picks the wrong interface (multi-homed host, unusual routing),
+pin it explicitly in inventory — per host or globally:
+
+```ini
+[peleon]
+peleon-1 ansible_host=... ansible_user=root dromos_egress_ifname=enx5
+```
+
+Then redeploy. `dromos-routing` also auto-detects the default-route interface at
+runtime as a fallback, so it stays correct even if the env file is absent.
 
 ## Backbone interface flapping
 

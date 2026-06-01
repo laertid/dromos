@@ -59,6 +59,22 @@
     group: root
     mode: "0755"
 
+# Carry the host-specific egress interface and role to runtime so dromos-routing
+# and dromos-healthcheck match what Ansible rendered into the nft NAT rules.
+# dromos_egress_ifname resolves from inventory/role defaults, which themselves
+# fall back to ansible_default_ipv4.interface; we coalesce once more here so a
+# missing fact still yields a sane value rather than an empty assignment.
+- name: Render Dromos runtime environment file
+  ansible.builtin.copy:
+    dest: "{{ dromos_config_dir }}/routing.env"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (dromos common role). Do not edit by hand.
+      DROMOS_ROLE={{ 'peleon' if 'peleon' in group_names else ('phebes' if 'phebes' in group_names else 'unknown') }}
+      DROMOS_EGRESS_IF={{ dromos_egress_ifname | default(ansible_default_ipv4.interface) | default('eth0') }}
+
 - name: Install dromos-healthcheck
   ansible.builtin.copy:
     src: "{{ playbook_dir }}/../../scripts/dromos-healthcheck"

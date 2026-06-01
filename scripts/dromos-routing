@@ -14,8 +14,22 @@
 #
 set -euo pipefail
 
+# Optional environment file rendered by Ansible (common role). It carries the
+# host-specific egress interface so runtime policy routing matches the nft NAT
+# rules. Sourced before the defaults below so an explicit env still wins.
+DROMOS_ROUTING_ENV="${DROMOS_ROUTING_ENV:-/etc/dromos/routing.env}"
+# shellcheck source=/dev/null
+[ -r "$DROMOS_ROUTING_ENV" ] && . "$DROMOS_ROUTING_ENV"
+
 DROMOS_CLIENT_IF="${DROMOS_CLIENT_IF:-dromos-client}"
 DROMOS_BACKBONE_IF="${DROMOS_BACKBONE_IF:-dromos-backbone}"
+# Egress interface: prefer an explicit value (env/file), else auto-detect the
+# host's default-route interface. Hardcoding eth0 was wrong on hosts whose
+# default route is e.g. enx5, breaking egress/NAT for RU-direct clients.
+detect_egress_if() {
+    ip route show default 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+DROMOS_EGRESS_IF="${DROMOS_EGRESS_IF:-$(detect_egress_if)}"
 DROMOS_EGRESS_IF="${DROMOS_EGRESS_IF:-eth0}"
 DROMOS_MARK_RU="${DROMOS_MARK_RU:-0x42}"
 DROMOS_MARK_FOREIGN="${DROMOS_MARK_FOREIGN:-0x43}"

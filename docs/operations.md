@@ -76,17 +76,32 @@ Switching geobase source: edit `/etc/dromos/geo.conf`. The script supports any U
 ## Healthcheck
 
 ```bash
-dromos-healthcheck
+dromos-healthcheck            # auto-detects role
+dromos-healthcheck --role peleon   # force role if needed
 ```
 
-Runs all of:
+The check is **role-aware**. It resolves the host role from (in order) the
+`--role` flag, the `DROMOS_ROLE` environment variable, `/etc/dromos/routing.env`
+(rendered by the common role), and finally auto-detection (a host with a
+`dromos-client` interface is Phebes; otherwise Peleon).
 
-- both WG interfaces up and have peers
+Both roles check:
+
 - backbone handshake age < 180s
-- ipset non-empty and not older than 14 days
-- `ip rule` entries for both marks
 - `nft` table `inet dromos` present with the expected chains
-- `ping -c 1` Peleon over the backbone
+- egress interface present (the host's NAT/default-route device)
+- `ping -c 1` the backbone peer (Peleon pings Phebes `10.77.0.1`; Phebes pings
+  Peleon `10.77.0.2`)
+
+Phebes additionally checks:
+
+- `dromos-client` up and has peers
+- RU ipset non-empty and not older than 14 days
+- `ip rule` fwmark entries for both marks
+
+Peleon has no `dromos-client`, no RU ipset, and no fwmark policy routing — it
+only terminates the backbone and NATs out its egress — so those Phebes-only
+probes are skipped there rather than reported as misleading failures.
 
 Exit code 0 on all OK; non-zero with summary on any failure. Suitable for monitoring.
 

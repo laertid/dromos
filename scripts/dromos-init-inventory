@@ -119,7 +119,11 @@ peleon
 dromos_client_subnet_v4 = 10.66.0.0/24
 dromos_client_ifname    = dromos-client
 dromos_backbone_ifname  = dromos-backbone
-dromos_egress_ifname    = eth0
+; Egress (NAT) interface. Left UNSET on purpose: each host auto-detects its
+; default-route interface from Ansible facts (ansible_default_ipv4.interface),
+; so a box on enx5 and a box on eth0 both work without editing this file. Only
+; set dromos_egress_ifname (per host above, or globally here) if auto-detection
+; picks the wrong interface.
 dromos_client_listen_port           = 51820
 dromos_backbone_listen_port_phebes  = 51821
 dromos_backbone_listen_port_peleon  = 51821
