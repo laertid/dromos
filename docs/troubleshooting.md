@@ -25,6 +25,25 @@ custom task, add the same:
     executable: /bin/bash
 ```
 
+### `wg: command not found` in bootstrap keygen
+
+Symptom (during `ansible-playbook ... site.yml`, on a fresh VPS):
+
+```
+TASK [Ensure backbone keypair exists]
+fatal: [phebes]: FAILED! => "/bin/bash: wg: command not found"
+```
+
+Cause: `bootstrap.yml` runs first (before the `common` role) and generates the
+backbone keypair with `wg genkey`, but on a clean install `wireguard-tools`
+isn't installed yet — that install lives in the `common` role, which runs in the
+later `phebes.yml` / `peleon.yml` plays. So `wg` doesn't exist at keygen time.
+
+Fixed in this repo: `bootstrap.yml` now installs `wireguard-tools` itself
+(idempotent `apt`) before the keygen task. The `common` role still installs the
+full package set later; that install is a no-op once bootstrap has run. If you
+maintain a custom bootstrap, install `wireguard-tools` before any `wg` call.
+
 ### `'dromos_secrets_dir' is undefined` in bootstrap.yml
 
 Symptom (during `ansible-playbook ... site.yml`, on a clean install):
