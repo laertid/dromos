@@ -45,6 +45,23 @@ def test_backbone_phebes_renders(env):
     assert "AllowedIPs = 10.77.0.2/32, 0.0.0.0/0" in out
 
 
+def test_backbone_peleon_renders(env):
+    tpl = env.get_template("wireguard/dromos-backbone-peleon.conf.j2")
+    out = tpl.render(
+        dromos_backbone_peleon_private_key="BBPRIV",
+        dromos_phebes_backbone_public_key="PHEBESPUB",
+    )
+    assert "[Peer]" in out
+    assert "PublicKey  = PHEBESPUB" in out
+    assert "AllowedIPs = 10.77.0.1/32, 10.66.0.0/24" in out
+    # Regression: an empty Phebes key used to render `PublicKey  = ` (trailing
+    # space, no value), which wg-quick rejects with "Line unrecognized:
+    # PublicKey=". The role now validates the key is non-empty before rendering;
+    # this guards the template contract the validation relies on.
+    assert "PublicKey  = \n" not in out
+    assert "PublicKey  =  " not in out
+
+
 def test_nftables_renders(env):
     tpl = env.get_template("nftables/dromos.nft.j2")
     out = tpl.render()
