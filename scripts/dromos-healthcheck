@@ -47,6 +47,35 @@ TABLE_RU=${DROMOS_TABLE_RU:-100}
 TABLE_FOREIGN=${DROMOS_TABLE_FOREIGN:-101}
 CACHE_DIR=${DROMOS_CACHE_DIR:-/var/cache/dromos}
 EGRESS_IF=${DROMOS_EGRESS_IF:-}
+RT_TABLES=${DROMOS_RT_TABLES:-/etc/iproute2/rt_tables}
+
+# `ip rule show` prints a routing table by *name* whenever the id has an alias
+# in /etc/iproute2/rt_tables (Dromos installs 100->dromos_ru, 101->dromos_foreign
+# via dromos-routing), and by numeric id otherwise. A check that greps only for
+# the numeric id therefore reports false [FAIL]s on a correctly-configured host.
+# Resolve the alias for an id so we can match either form.
+rt_table_name() {
+    local id="$1"
+    awk -v id="$id" '
+        /^[[:space:]]*#/ {next}
+        $1 == id {print $2; found=1; exit}
+        END {if(!found) exit 1}
+    ' "$RT_TABLES" 2>/dev/null
+}
+
+# True if an `ip rule` matching the given fwmark routes to the given table,
+# whether iproute2 printed the table as its numeric id or its rt_tables alias.
+# fwmark is matched on either short (0x42) or zero-padded (0x00000042) form.
+ip_rule_has_fwmark() {
+    local mark="$1" table_id="$2" name
+    local mark_norm
+    mark_norm=$(printf '%#x' "$mark" 2>/dev/null || echo "$mark")
+    name=$(rt_table_name "$table_id" || true)
+    local table_pat="$table_id"
+    [[ -n "$name" ]] && table_pat="(${table_id}|${name})"
+    ip rule show 2>/dev/null \
+        | grep -Eq "fwmark (${mark}|${mark_norm})\b.*lookup ${table_pat}\b"
+}
 
 # Auto-detect role if still unknown: Phebes is the only host with dromos-client.
 if [[ -z "$ROLE" ]]; then
@@ -153,13 +182,13 @@ if [[ "$ROLE" == "phebes" ]]; then
         warn "no geobase cache timestamp"
     fi
 
-    # fwmark policy-routing rules
-    if ip rule show | grep -q "fwmark $MARK_RU lookup $TABLE_RU"; then
+    # fwmark policy-routing rules (table may print as id or rt_tables alias)
+    if ip_rule_has_fwmark "$MARK_RU" "$TABLE_RU"; then
         ok "ip rule fwmark $MARK_RU -> $TABLE_RU present"
     else
         fail "ip rule fwmark $MARK_RU -> $TABLE_RU missing"
     fi
-    if ip rule show | grep -q "fwmark $MARK_FOREIGN lookup $TABLE_FOREIGN"; then
+    if ip_rule_has_fwmark "$MARK_FOREIGN" "$TABLE_FOREIGN"; then
         ok "ip rule fwmark $MARK_FOREIGN -> $TABLE_FOREIGN present"
     else
         fail "ip rule fwmark $MARK_FOREIGN -> $TABLE_FOREIGN missing"

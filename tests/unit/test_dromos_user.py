@@ -120,6 +120,11 @@ def test_server_conf_render_has_peer_blocks(lab):
     conf = du.render_server_conf(state)
     assert conf.count("[Peer]") == 3
     assert "ListenPort = 51820" in conf
+    # The server (gateway) address is the first host of the subnet, .1/24 --
+    # never the network address, and never handed out to a user.
+    assert "Address    = 10.66.0.1/24" in conf
+    assert "Address    = 10.66.0.0/24" not in conf
+    assert "10.66.0.1" not in {u["address"] for u in state["users"]}
     for n in ("u1", "u2", "u3"):
         assert f"# {n}" in conf
 

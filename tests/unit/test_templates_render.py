@@ -34,6 +34,28 @@ def test_client_facing_wg_renders(env):
     assert "AllowedIPs = 10.66.0.3/32" in out
 
 
+def test_client_facing_wg_address_defaults_to_gateway_host_not_network(env):
+    """The iface Address must be a usable host (10.66.0.1/24), never the subnet
+    network address. Regression: live Phebes rendered `Address = 10.66.0.0/24`
+    because the template used dromos_client_subnet_v4 directly."""
+    tpl = env.get_template("wireguard/dromos-client.conf.j2")
+    out = tpl.render(dromos_server_private_key="SERVERPRIV")
+    assert "Address    = 10.66.0.1/24" in out
+    # The network address must never be used as the interface address.
+    assert "Address    = 10.66.0.0/24" not in out
+
+
+def test_client_facing_wg_address_honours_explicit_gateway(env):
+    tpl = env.get_template("wireguard/dromos-client.conf.j2")
+    out = tpl.render(
+        dromos_server_private_key="SERVERPRIV",
+        dromos_client_subnet_v4="10.66.0.0/24",
+        dromos_client_gateway_v4="10.66.0.1/24",
+    )
+    assert "Address    = 10.66.0.1/24" in out
+    assert "Address    = 10.66.0.0/24" not in out
+
+
 def test_backbone_phebes_renders(env):
     tpl = env.get_template("wireguard/dromos-backbone-phebes.conf.j2")
     out = tpl.render(
