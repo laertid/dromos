@@ -21,6 +21,14 @@ table inet dromos {
     # ---- mark locally-originated SS/OVPN traffic the same way ----
     chain mark_local {
         type route hook output priority mangle; policy accept;
+        # SSH is sacred: never mark the host's own SSH management traffic, or a
+        # mark would policy-route the reply out a Dromos table and lock us out.
+        # This guard is belt-and-suspenders -- sshd runs as uid 0, not the
+        # SS/OVPN uids below -- but it survives a future uid reassignment.
+        tcp sport {{ dromos_ssh_port | default(22) }} return
+        tcp dport {{ dromos_ssh_port | default(22) }} return
+        # Already-established host connections keep whatever path they had.
+        ct state established,related return
         meta mark != 0 return
         meta skuid {{ dromos_ss_uid | default(998) }} ip daddr @dromos_ru4 \
             meta mark set {{ dromos_mark_ru | default('0x42') }} return

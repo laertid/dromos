@@ -163,15 +163,72 @@ systemctl restart dromos-routing.service
 # this re-applies all ip rule / ip route commands from /etc/dromos/routing.conf
 ```
 
-## "I locked myself out of SSH"
+## "I locked myself out of SSH after running site.yml" (port 22 open, banner hangs)
 
-You should not be able to with Dromos alone — it never touches the `inet filter` or `ip filter` tables used by the default firewall, nor SSH config. If you did:
+**Symptom:** from outside, TCP/22 is *open* (the SYN-ACK comes back) but the SSH
+banner never arrives — the connection hangs right after the TCP handshake and
+times out. Ping may still work. This is the classic asymmetric-routing
+lock-out: the host's SYN-ACK leaves via the input/local path, but the
+*established* reply packets (banner + everything after) get policy-routed out a
+Dromos interface and never return to you.
+
+**Root cause (fixed in this repo):** the Phebes backbone WireGuard config used
+`AllowedIPs = ..., 0.0.0.0/0` with no `Table` setting. `wg-quick` interprets a
+default route in `AllowedIPs` as "route everything through me": it installs a
+`default dev dromos-backbone` route in its own table plus a
+`suppress_prefixlength 0` ip rule, which steals **all** host traffic that isn't
+marked with wg's own fwmark — including sshd's replies. The fix is
+`Table = off` on every Dromos `wg-quick` interface (Dromos does its own
+policy routing via `dromos-routing`), plus an explicit SSH bypass in the
+`mark_local` nft chain and a deploy-time deadman that auto-reverts.
+
+### Recover from the provider console / serial console
+
+You do **not** need to rebuild. Run these on the box (they only undo Dromos):
+
+```bash
+# 1. Stop the interfaces that installed the hijacking routes/rules.
+systemctl stop wg-quick@dromos-backbone wg-quick@dromos-client
+
+# 2. Tear down Dromos policy routing (idempotent, safe).
+/usr/local/sbin/dromos-routing teardown backbone
+/usr/local/sbin/dromos-routing teardown client
+
+# 3. Remove any leftover wg-quick hijack rules/route, if present.
+#    wg-quick's default-route takeover uses fwmark 0xca6c / table 51820.
+ip rule del not fwmark 0xca6c table 51820 2>/dev/null || true
+ip rule del table main suppress_prefixlength 0 2>/dev/null || true
+ip route flush table 51820 2>/dev/null || true
+
+# 4. Confirm the host default route + main lookup are intact.
+ip rule show          # 'from all lookup main' should be priority 32766
+ip route show default # should point at the provider gateway via eth0
+```
+
+SSH should recover immediately. Then pull the fixed configs and redeploy:
+
+```bash
+# the rendered config still has the bad line until you redeploy
+grep -n '0.0.0.0/0' /etc/wireguard/dromos-backbone.conf
+grep -n '^Table'    /etc/wireguard/dromos-backbone.conf   # should be 'Table = off'
+```
+
+If a future Dromos change ever does this again, the deploy-time deadman
+(`dromos_deadman_enabled`, default on) tears Dromos down ~5 min after the unit
+restart unless the deploy confirms SSH survived — so an unattended run can no
+longer leave you locked out.
+
+### Other (non-Dromos) lockouts
+
+Dromos never touches the `inet filter` / `ip filter` tables or SSH config, so a
+*drop*-based lockout is not Dromos:
 
 1. Use your provider's web console / serial console.
-2. `nft list ruleset` and check that no Dromos chain has a `drop` rule on TCP/22.
-3. `ip rule show` — confirm `from all lookup main` still has priority < 32766. If Dromos rules are at lower priority somehow, delete them: `ip rule del fwmark 0x42 lookup 100`.
+2. `nft list ruleset` and check no chain has a `drop` rule on TCP/22.
+3. `ip rule show` — confirm `from all lookup main` still has priority < 32766.
 
-If you can't recover via console: snapshot the disk, rebuild Phebes from scratch, restore from backup.
+If you truly can't recover via console: snapshot the disk, rebuild Phebes from
+scratch, restore from backup.
 
 ## Backbone interface flapping
 

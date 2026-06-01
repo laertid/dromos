@@ -1,9 +1,28 @@
-{# Phebes side of the Phebes<->Peleon backbone. #}
+{# Phebes side of the Phebes<->Peleon backbone.
+
+   Table = off is REQUIRED.  Without it, wg-quick sees the 0.0.0.0/0 in
+   AllowedIPs below and performs its default-route takeover: it installs a
+   `default dev dromos-backbone` route in its own table plus a
+   `suppress_prefixlength 0` policy rule, which silently steals ALL host
+   traffic that isn't marked with wg's fwmark -- including the host's own SSH
+   reply packets.  The host stays pingable and TCP/22 still SYN-ACKs (handled
+   in the input path), but the SSH banner and every subsequent reply get routed
+   out the backbone toward Peleon and never reach the client, so the session
+   hangs after the TCP handshake.  This is the Phebes SSH-lockout bug.
+
+   Dromos does its OWN policy routing for foreign-marked client traffic
+   (`dromos-routing apply backbone` installs `default dev dromos-backbone` in
+   table {{ dromos_table_foreign | default(101) }}, reached only via fwmark
+   {{ dromos_mark_foreign | default('0x43') }}).  wg-quick must not touch the
+   routing tables at all.  We keep 0.0.0.0/0 in AllowedIPs purely as the
+   cryptokey-routing decision (what this interface is allowed to encrypt to
+   Peleon); with Table = off it no longer affects host routing. #}
 [Interface]
 Address    = {{ dromos_backbone_phebes_addr | default('10.77.0.1/30') }}
 ListenPort = {{ dromos_backbone_listen_port_phebes | default(51821) }}
 PrivateKey = {{ dromos_backbone_phebes_private_key }}
 MTU        = {{ dromos_backbone_mtu | default(1380) }}
+Table      = off
 
 PreUp  = sysctl -w net.ipv6.conf.dromos-backbone.disable_ipv6=1 2>/dev/null || true
 PostUp = /usr/local/sbin/dromos-routing apply backbone

@@ -123,6 +123,23 @@
       WantedBy=multi-user.target
   notify: reload systemd
 
+# --- SSH-lockout deadman ----------------------------------------------------
+# Starting the Dromos WG/nft units is the one moment a deploy can sever the
+# operator's SSH session (see docs/troubleshooting.md "I locked myself out").
+# Before touching them we arm a transient timer that tears Dromos back down
+# unless the deploy reaches the "disarm" task below. If the box becomes
+# unreachable mid-deploy, the timer fires and restores SSH on its own.
+- name: Arm SSH-lockout deadman (auto-rollback if deploy loses the host)
+  ansible.builtin.command:
+    cmd: >-
+      systemd-run --on-active={{ dromos_deadman_minutes | default(5) }}min
+      --unit=dromos-deadman --collect
+      /bin/sh -c 'systemctl stop wg-quick@dromos-client wg-quick@dromos-backbone dromos-nft.service;
+                  /usr/local/sbin/dromos-routing teardown client;
+                  /usr/local/sbin/dromos-routing teardown backbone'
+  changed_when: true
+  when: dromos_deadman_enabled | default(true) | bool
+
 - name: Enable Dromos units
   ansible.builtin.systemd:
     name: "{{ item }}"
@@ -133,6 +150,15 @@
     - dromos-nft.service
     - wg-quick@dromos-backbone.service
     - wg-quick@dromos-client.service
+
+# If we got here, this Ansible task ran -> the control connection survived the
+# unit restart -> SSH is fine. Cancel the rollback.
+- name: Disarm SSH-lockout deadman (SSH survived the unit restart)
+  ansible.builtin.command:
+    cmd: systemctl stop dromos-deadman.timer dromos-deadman.service
+  changed_when: true
+  failed_when: false
+  when: dromos_deadman_enabled | default(true) | bool
 
 - name: Install geo-update script + timer
   ansible.builtin.copy:
