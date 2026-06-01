@@ -199,6 +199,21 @@
     group: root
     mode: "0755"
 
+# Carry the client-facing endpoint + listen port to runtime so `dromos-user`
+# generates client configs with the inventory endpoint (dromos_phebes_endpoint)
+# instead of the hardcoded script default. Without this, a config generated on a
+# freshly deployed host pointed at the script's placeholder endpoint.
+- name: Render Dromos client environment file
+  ansible.builtin.copy:
+    dest: "{{ dromos_config_dir }}/client.env"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (dromos phebes role). Do not edit by hand.
+      DROMOS_PHEBES_ENDPOINT={{ dromos_phebes_endpoint }}
+      DROMOS_CLIENT_LISTEN_PORT={{ dromos_client_listen_port | default(51820) }}
+
 - name: Install dromos-user CLI
   ansible.builtin.copy:
     src: "{{ playbook_dir }}/../../scripts/dromos-user"

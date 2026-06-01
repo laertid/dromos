@@ -17,8 +17,22 @@ Effect:
 - Generates a fresh WG keypair under `/etc/dromos/secrets/clients/alice/`.
 - Allocates the next free `10.66.0.X` IP.
 - Appends an `[Peer]` block to `dromos-client` and reloads.
-- Writes the user-facing config to `/etc/dromos/secrets/clients/alice/alice.conf`.
-- Prints the config to stdout (also QR code if `qrencode` is installed) so you can hand it off.
+- Writes the user-facing config to `/etc/dromos/secrets/clients/alice/alice.conf` (mode `0600`).
+- Prints a **secret-free summary** to stdout (name, IP, public key, endpoint, config path).
+
+The client `Endpoint` is taken from `/etc/dromos/client.env` (written by Ansible
+from the inventory `dromos_phebes_endpoint` / `dromos_client_listen_port`), so a
+freshly deployed host generates configs pointed at the right public endpoint.
+
+> **The private key and preshared key are no longer printed by default.** This
+> keeps them out of shell history, terminal scrollback, and orchestration/CI
+> logs. To view or hand off the full config, use one of:
+>
+> ```bash
+> dromos-user show alice           # print the full config of an existing user
+> dromos-user add alice --show-config   # print full config when creating
+> sudo cat /etc/dromos/secrets/clients/alice/alice.conf
+> ```
 
 After running, **copy `/etc/dromos/secrets/clients/alice/alice.conf` off the server** to your operator backup directory. The server keeps it for convenience but the operator backup is canonical.
 

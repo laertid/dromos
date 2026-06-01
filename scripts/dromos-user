@@ -20,11 +20,44 @@ import sys
 from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("DROMOS_CONFIG_DIR", "/etc/dromos"))
+
+
+def _load_env_file(path: Path) -> None:
+    """Populate os.environ from a KEY=VALUE env file for keys not already set.
+
+    Ansible writes /etc/dromos/client.env with the inventory-configured endpoint
+    and client listen port. A real environment variable always wins (so an
+    operator can still override on the command line); the file only supplies
+    values the caller did not set, so the deployed default is the inventory
+    value rather than the script's placeholder.
+    """
+    try:
+        text = path.read_text()
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file(Path(os.environ.get("DROMOS_CLIENT_ENV", str(CONFIG_DIR / "client.env"))))
+
 SECRETS_DIR = Path(os.environ.get("DROMOS_SECRETS_DIR", "/etc/dromos/secrets"))
 WG_CONF = Path(os.environ.get("DROMOS_WG_CONF", "/etc/wireguard/dromos-client.conf"))
 CLIENT_SUBNET = os.environ.get("DROMOS_CLIENT_SUBNET", "10.66.0.0/24")
 CLIENT_IF = os.environ.get("DROMOS_CLIENT_IF", "dromos-client")
-LISTEN_PORT = int(os.environ.get("DROMOS_CLIENT_PORT", "51820"))
+# Accept either DROMOS_CLIENT_LISTEN_PORT (written by Ansible into client.env,
+# matching the inventory var name) or the legacy DROMOS_CLIENT_PORT.
+LISTEN_PORT = int(
+    os.environ.get("DROMOS_CLIENT_LISTEN_PORT")
+    or os.environ.get("DROMOS_CLIENT_PORT", "51820")
+)
 ENDPOINT = os.environ.get("DROMOS_PHEBES_ENDPOINT", "phebes.example.ru")
 DNS = os.environ.get("DROMOS_CLIENT_DNS", "10.66.0.1")
 MTU = int(os.environ.get("DROMOS_CLIENT_MTU", "1380"))
@@ -133,6 +166,28 @@ PersistentKeepalive = 25
 """
 
 
+def _safe_summary(user: dict, conf_path: Path) -> str:
+    """Non-secret summary safe to print to a terminal or a log.
+
+    Deliberately excludes PrivateKey and PresharedKey -- printing those to
+    stdout means they end up in shell history, terminal scrollback, CI logs,
+    and orchestration captures.
+    """
+    return (
+        f"user:       {user['name']}\n"
+        f"address:    {user['address']}/32\n"
+        f"public_key: {user['public_key']}\n"
+        f"endpoint:   {ENDPOINT}:{LISTEN_PORT}\n"
+        f"config:     {conf_path}\n"
+        "\n"
+        "The config contains a private key and preshared key and is NOT printed\n"
+        "by default. To view or hand it off, run one of:\n"
+        f"  dromos-user show {user['name']}\n"
+        f"  dromos-user add {user['name']} --show-config\n"
+        f"  sudo cat {conf_path}"
+    )
+
+
 def cmd_add(args) -> int:
     state = load_users()
     if any(u["name"] == args.name for u in state["users"]):
@@ -162,12 +217,28 @@ def cmd_add(args) -> int:
     (user_dir / "preshared").write_text(psk + "\n")
     os.chmod(user_dir / "preshared", 0o600)
     client_conf = render_client_conf(user)
-    (user_dir / f"{args.name}.conf").write_text(client_conf)
-    os.chmod(user_dir / f"{args.name}.conf", 0o600)
+    conf_path = user_dir / f"{args.name}.conf"
+    conf_path.write_text(client_conf)
+    os.chmod(conf_path, 0o600)
 
     reload_wg(render_server_conf(state))
-    print(client_conf)
-    print(f"# wrote {user_dir / (args.name + '.conf')}", file=sys.stderr)
+    # Default output is secret-free. Operators opt in to the full config with
+    # --show-config (or `dromos-user show <name>` / `sudo cat`).
+    if getattr(args, "show_config", False):
+        print(client_conf)
+    else:
+        print(_safe_summary(user, conf_path))
+    print(f"# wrote {conf_path}", file=sys.stderr)
+    return 0
+
+
+def cmd_show(args) -> int:
+    state = load_users()
+    user = next((u for u in state["users"] if u["name"] == args.name), None)
+    if user is None:
+        print(f"user {args.name} not found", file=sys.stderr)
+        return 1
+    print(render_client_conf(user))
     return 0
 
 
@@ -203,8 +274,16 @@ def cmd_list(args) -> int:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="dromos-user")
     sub = p.add_subparsers(dest="cmd", required=True)
-    a = sub.add_parser("add"); a.add_argument("name"); a.set_defaults(func=cmd_add)
+    a = sub.add_parser("add"); a.add_argument("name")
+    a.add_argument(
+        "--show-config",
+        action="store_true",
+        help="print the full client config (incl. PrivateKey/PresharedKey) to stdout",
+    )
+    a.set_defaults(func=cmd_add)
     r = sub.add_parser("remove"); r.add_argument("name"); r.set_defaults(func=cmd_remove)
+    s = sub.add_parser("show", help="print an existing user's full client config")
+    s.add_argument("name"); s.set_defaults(func=cmd_show)
     sub.add_parser("list").set_defaults(func=cmd_list)
     args = p.parse_args(argv)
     return args.func(args)

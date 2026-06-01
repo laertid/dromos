@@ -19,6 +19,19 @@ REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "dromos-user"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_environ():
+    """load_user_module writes config into os.environ; snapshot and restore so
+    one test's DROMOS_* values cannot leak into the next (tests run in-process
+    and the module reads these at import time)."""
+    saved = dict(os.environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
 def load_user_module(env: dict) -> object:
     from importlib.machinery import SourceFileLoader
     for k, v in env.items():
@@ -141,3 +154,94 @@ def test_client_conf_has_endpoint(lab):
     assert "Endpoint   = test.example.com:51820" in conf
     assert "AllowedIPs = 0.0.0.0/0" in conf
     assert "PrivateKey =" in conf
+
+
+def test_endpoint_and_port_read_from_client_env(lab, monkeypatch):
+    """A deployed host with no DROMOS_PHEBES_ENDPOINT env override must pick up
+    the endpoint + listen port from /etc/dromos/client.env (written by Ansible),
+    not the script's hardcoded placeholder."""
+    sys.modules.pop("dromos_user_mod", None)
+    # Simulate a real host: the override env vars are NOT set, only the env file.
+    monkeypatch.delenv("DROMOS_PHEBES_ENDPOINT", raising=False)
+    monkeypatch.delenv("DROMOS_CLIENT_LISTEN_PORT", raising=False)
+    monkeypatch.delenv("DROMOS_CLIENT_PORT", raising=False)
+    env = {k: v for k, v in lab.items() if k != "DROMOS_PHEBES_ENDPOINT"}
+    client_env = Path(env["DROMOS_CONFIG_DIR"]) / "client.env"
+    client_env.write_text(
+        "# Managed by Ansible\n"
+        "DROMOS_PHEBES_ENDPOINT=phebes.local\n"
+        "DROMOS_CLIENT_LISTEN_PORT=51999\n"
+    )
+    env["DROMOS_CLIENT_ENV"] = str(client_env)
+
+    du = load_user_module(env)
+    assert du.ENDPOINT == "phebes.local"
+    assert du.LISTEN_PORT == 51999
+
+    class A: pass
+    a = A(); a.name = "dave"; a.show_config = True
+    du.cmd_add(a)
+    conf = du.render_client_conf(du.load_users()["users"][0])
+    assert "Endpoint   = phebes.local:51999" in conf
+    # The placeholder must never leak into a deployed config.
+    assert "phebes.example.ru" not in conf
+
+
+def test_real_env_overrides_client_env(lab, monkeypatch):
+    """An explicit DROMOS_PHEBES_ENDPOINT env var still wins over the file."""
+    sys.modules.pop("dromos_user_mod", None)
+    monkeypatch.delenv("DROMOS_CLIENT_LISTEN_PORT", raising=False)
+    client_env = Path(lab["DROMOS_CONFIG_DIR"]) / "client.env"
+    client_env.write_text("DROMOS_PHEBES_ENDPOINT=phebes.local\n")
+    env = dict(lab)  # keeps DROMOS_PHEBES_ENDPOINT=test.example.com
+    env["DROMOS_CLIENT_ENV"] = str(client_env)
+    du = load_user_module(env)
+    assert du.ENDPOINT == "test.example.com"
+
+
+def test_add_default_output_has_no_secrets(lab, capsys):
+    """Default `add` output must not leak PrivateKey/PresharedKey."""
+    sys.modules.pop("dromos_user_mod", None)
+    du = load_user_module(lab)
+
+    class A: pass
+    a = A(); a.name = "erin"; a.show_config = False
+    assert du.cmd_add(a) == 0
+    out = capsys.readouterr().out
+    assert "PrivateKey" not in out
+    assert "PresharedKey" not in out
+    # But a useful, non-secret summary is present.
+    assert "public_key:" in out
+    assert "erin" in out
+
+
+def test_add_show_config_prints_full_conf(lab, capsys):
+    """--show-config opts back into printing the full config."""
+    sys.modules.pop("dromos_user_mod", None)
+    du = load_user_module(lab)
+
+    class A: pass
+    a = A(); a.name = "frank"; a.show_config = True
+    assert du.cmd_add(a) == 0
+    out = capsys.readouterr().out
+    assert "PrivateKey =" in out
+    assert "PresharedKey =" in out
+
+
+def test_show_command_prints_existing_user(lab, capsys):
+    sys.modules.pop("dromos_user_mod", None)
+    du = load_user_module(lab)
+
+    class A: pass
+    a = A(); a.name = "grace"; a.show_config = False
+    du.cmd_add(a)
+    capsys.readouterr()  # drain
+
+    s = A(); s.name = "grace"
+    assert du.cmd_show(s) == 0
+    out = capsys.readouterr().out
+    assert "PrivateKey =" in out
+    assert "Endpoint   = test.example.com:51820" in out
+
+    missing = A(); missing.name = "nope"
+    assert du.cmd_show(missing) == 1

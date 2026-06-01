@@ -88,10 +88,14 @@ scripts/dromos-init-inventory
 # Run from the repo root: the ansible.cfg there points roles_path at ansible/roles.
 ansible-playbook -i ansible/inventory/prod.ini ansible/playbooks/site.yml
 
-# 3. Add a user (on Phebes)
+# 3. Add a user (on Phebes). Prints a secret-free summary + the config path.
 scripts/dromos-user add alice
 
-# 4. Hand alice the generated WG config (also pushed to your backup dir)
+# 4. Retrieve the full WG config to hand to alice (contains private + preshared
+#    keys, so it is not printed by default):
+scripts/dromos-user show alice
+#    or: sudo cat /etc/dromos/secrets/clients/alice/alice.conf
+#    The config's Endpoint comes from dromos_phebes_endpoint in your inventory.
 ```
 
 ### Clean install: how the backbone keys are handled
