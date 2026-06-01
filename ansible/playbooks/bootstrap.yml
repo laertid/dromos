@@ -17,6 +17,18 @@
   become: true
   gather_facts: false
   tasks:
+    # The full package set is installed later by the common role, but the
+    # keygen below needs `wg` *now* — on a fresh VPS wireguard-tools isn't yet
+    # present, so `wg genkey` fails with "wg: command not found". Install just
+    # that one package here. apt is idempotent and the common role's later
+    # install is a no-op once this has run.
+    - name: Ensure wireguard-tools is present for keygen
+      ansible.builtin.apt:
+        name: wireguard-tools
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
     - name: Ensure secrets directory exists
       ansible.builtin.file:
         path: "{{ dromos_secrets_dir }}"
