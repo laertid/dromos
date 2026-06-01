@@ -6,3 +6,5 @@ dromos_backbone_peleon_addr: 10.77.0.2/30
 dromos_backbone_phebes_addr_only: 10.77.0.1/32
 dromos_client_subnet_v4: 10.66.0.0/24
 dromos_backbone_mtu: 1380
+# SSH ingress port to protect from Dromos marking (see phebes defaults).
+dromos_ssh_port: 22

@@ -37,10 +37,15 @@ host_default_gw() {
     ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}'
 }
 
+# Add an `ip rule` only if an equivalent fwmark->table rule is absent.
+# Matching on the (fwmark, table) pair keeps this idempotent regardless of how
+# `ip rule show` spaces or normalises the line (e.g. "0x42" vs "0x00000042").
 rule_add_idempotent() {
-    local args="$*"
-    if ! ip rule show | grep -q "fwmark ${args##*fwmark }"; then
-        ip rule add $args
+    local mark="$1" table="$2"
+    local mark_norm
+    mark_norm=$(printf '%#x' "$mark")   # normalise 0x42 / 66 -> 0x42
+    if ! ip rule show | grep -Eiq "fwmark (${mark}|${mark_norm})\b.*lookup ${table}\b"; then
+        ip rule add fwmark "$mark" lookup "$table"
     fi
 }
 
@@ -64,8 +69,8 @@ apply_client() {
         log "NOTE: $DROMOS_BACKBONE_IF not up yet; foreign table will fill on backbone bringup"
     fi
 
-    rule_add_idempotent "fwmark $DROMOS_MARK_RU      lookup $DROMOS_TABLE_RU"
-    rule_add_idempotent "fwmark $DROMOS_MARK_FOREIGN lookup $DROMOS_TABLE_FOREIGN"
+    rule_add_idempotent "$DROMOS_MARK_RU"      "$DROMOS_TABLE_RU"
+    rule_add_idempotent "$DROMOS_MARK_FOREIGN" "$DROMOS_TABLE_FOREIGN"
 
     sysctl -qw "net.ipv4.conf.${DROMOS_CLIENT_IF}.rp_filter=0" || true
 }
