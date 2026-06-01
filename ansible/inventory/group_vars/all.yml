@@ -1,0 +1,11 @@
+---
+# Shared infrastructure paths for every Dromos host.
+#
+# These live in inventory group_vars (not a role's defaults/) on purpose: the
+# bootstrap.yml play runs with no roles applied, so it cannot see role defaults.
+# group_vars/all is auto-loaded for *every* play in the run — bootstrap and the
+# role plays alike — which keeps a single source of truth and lets bootstrap
+# resolve dromos_secrets_dir on a clean install.
+dromos_config_dir: /etc/dromos
+dromos_secrets_dir: /etc/dromos/secrets
+dromos_cache_dir: /var/cache/dromos
