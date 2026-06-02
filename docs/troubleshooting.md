@@ -2,6 +2,60 @@
 
 Recipes for common Dromos failures. Each starts with the symptom.
 
+## Start here: `dromos-diagnose` (whole-path check from your workstation)
+
+Before digging into any single recipe below, run the control-machine diagnostic.
+It answers the four questions you almost always start with — *is Phebes up, is
+Peleon up, does the raw network between them work, does WireGuard between them
+work* — in one pass, by reaching both nodes over SSH using your inventory:
+
+```bash
+scripts/dromos-diagnose -i ansible/inventory/prod.ini
+```
+
+It prints one `[OK]`/`[WARN]`/`[FAIL]` line per check, grouped into sections:
+
+```
+== Phebes host ==        SSH+sudo, services, routing.env egress, dromos-healthcheck
+== Peleon host ==        SSH+sudo, services, egress, UFW route-allow, dromos-healthcheck
+== Phebes <-> Peleon raw network ==   public UDP/51821 path (send + arrival)
+== Phebes <-> Peleon WireGuard ==     handshake age, peer endpoint, counters, backbone ping
+== Client path readiness (Phebes) ==  client iface, geobase ipset, fwmark policy rules
+== Summary ==            counts; exit status is nonzero if anything FAILed
+```
+
+The exit code is `0` when everything is green (warnings are allowed), and `1`
+if any check FAILs — so it drops straight into CI or a cron alert.
+
+How it works and what it will *not* do:
+
+- It is **read-only and non-invasive**. It never edits a host, installs
+  packages, changes the firewall, or restarts services. It is the
+  control-machine counterpart to the host-local `dromos-healthcheck` (which it
+  also runs remotely on each node and folds into the report).
+- It **never prints private keys or client configs.** Safe to paste into a
+  ticket or chat.
+- The **raw-network** check sends a few UDP datagrams from Phebes to
+  `Peleon:51821` (using Python, so it does **not** need `nc`). To confirm the
+  packets actually *arrive*, it uses `tcpdump` on Peleon **only if it is already
+  installed** — if not, it reports `[WARN] ... skipped` with an install hint and
+  leaves the host untouched. The WireGuard handshake check below it is the
+  authoritative signal in that case.
+
+Useful flags: `--skip-network`, `--skip-client`, `--ssh-user USER`,
+`--ssh-key PATH`, `--timeout SECONDS`, `-v/--verbose` (show command output on
+failures). See `scripts/dromos-diagnose --help`.
+
+### Reading the result
+
+| Section that FAILs | Most likely cause | Recipe below |
+|--------------------|-------------------|--------------|
+| Phebes/Peleon host: service not active | a `wg-quick@`/`dromos-nft` unit is down | restart the unit; see service-specific recipes |
+| Raw network: Peleon saw no inbound UDP | host firewall / cloud security group blocks UDP/51821 | [Backbone never handshakes (UFW silently drops the WG port)](#backbone-never-handshakes-ufw-silently-drops-the-wg-port) |
+| WireGuard: no/stale handshake | backbone down or peer key mismatch | ["I can connect but nothing loads"](#i-can-connect-but-nothing-loads) |
+| Peleon: UFW route-allow missing | forwarded client traffic dropped on Peleon | ["Foreign sites don't load at all"](#foreign-sites-dont-load-at-all) (point 4) |
+| Client path: geobase empty / fwmark rule missing | ipset not populated or policy routing gone | ["RU sites are slow / show foreign IP"](#ru-sites-are-slow--show-foreign-ip) |
+
 ## Install / first run
 
 ### `set: Illegal option -o pipefail`

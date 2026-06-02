@@ -1,0 +1,523 @@
+#!/bin/bash
+# dromos-diagnose -- operator-facing, control-machine diagnostics for a Dromos
+# two-hop VPN. Run it from your workstation against the inventory; it reaches
+# both nodes over SSH and answers four questions, in order:
+#
+#   1. Does Phebes work?              (entry node: services, healthcheck, client)
+#   2. Does Peleon work?              (exit node:  services, healthcheck, NAT)
+#   3. Does the raw network work?     (Phebes -> Peleon public UDP 51821 path)
+#   4. Does WireGuard work?           (backbone handshake, counters, backbone ping)
+#
+# plus an optional client-path readiness section (Phebes client interface +
+# policy routing). Output is one [OK]/[WARN]/[FAIL] line per check, grouped by
+# section; exit status is nonzero if any check FAILs (WARN never fails the run).
+#
+# This is the control-machine counterpart to the host-local `dromos-healthcheck`
+# (which it also invokes remotely on each node). dromos-healthcheck answers
+# "is this host healthy?"; dromos-diagnose answers "is the whole two-hop path
+# healthy, and if not, which hop and which layer is broken?".
+#
+# It is NON-INVASIVE by default: it only reads state. It never edits the hosts,
+# never installs packages, and never prints private keys or client configs. When
+# a probe needs a tool that isn't present (e.g. tcpdump for the UDP path check),
+# it reports [WARN] ... skipped with an install hint rather than changing the host.
+#
+# Usage:
+#   scripts/dromos-diagnose -i ansible/inventory/prod.ini
+#
+# Flags:
+#   -i, --inventory PATH   Ansible inventory to read host addresses from. REQUIRED.
+#   --ssh-user USER        Override SSH user (else taken from inventory, else root).
+#   --ssh-key PATH         SSH private key to use for both nodes.
+#   --timeout SECONDS      Per-SSH connect timeout (default 10).
+#   --skip-network         Skip the raw Phebes->Peleon UDP path section.
+#   --skip-client          Skip the client-path readiness section.
+#   -v, --verbose          Show the underlying command output on failures.
+#   -h, --help             Show this help.
+#
+# Exit codes: 0 = all green (WARNs allowed), 1 = at least one FAIL, 2 = usage error.
+set -uo pipefail
+
+INVENTORY=""
+SSH_USER_OVERRIDE=""
+SSH_KEY=""
+SSH_TIMEOUT=10
+DO_NETWORK=1
+DO_CLIENT=1
+VERBOSE=0
+
+# Defaults; overridden by values parsed from the inventory's [dromos:vars].
+BACKBONE_IF="dromos-backbone"
+CLIENT_IF="dromos-client"
+BACKBONE_PORT_PELEON="51821"
+PHEBES_BACKBONE_ADDR="10.77.0.1"
+PELEON_BACKBONE_ADDR="10.77.0.2"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 2; }
+usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -i|--inventory) INVENTORY=${2:-}; shift 2 ;;
+        --inventory=*)  INVENTORY=${1#*=}; shift ;;
+        --ssh-user)     SSH_USER_OVERRIDE=${2:-}; shift 2 ;;
+        --ssh-key)      SSH_KEY=${2:-}; shift 2 ;;
+        --timeout)      SSH_TIMEOUT=${2:-}; shift 2 ;;
+        --skip-network) DO_NETWORK=0; shift ;;
+        --skip-client)  DO_CLIENT=0; shift ;;
+        -v|--verbose)   VERBOSE=1; shift ;;
+        -h|--help)      usage ;;
+        *)              die "unknown argument: $1 (try --help)" ;;
+    esac
+done
+
+[[ -n "$INVENTORY" ]] || die "an inventory is required (-i PATH); see --help"
+[[ -r "$INVENTORY" ]] || die "inventory not readable: $INVENTORY"
+
+# ---------------------------------------------------------------------------
+# Inventory parsing (pure text; no Ansible required just to read addresses).
+#
+# We read two things from the INI inventory:
+#   * the first host line under [phebes] and under [peleon] -- for ansible_host
+#     (the SSH target), ansible_user, and any ansible_ssh_private_key_file.
+#   * selected keys from [dromos:vars] -- interface names, the Peleon backbone
+#     port, and dromos_peleon_host (the public IP used for the raw UDP probe).
+# The parser tolerates `key = value` and `key=value`, ignores ; and # comments,
+# and only tracks the [phebes]/[peleon]/[dromos:vars] sections it cares about.
+# ---------------------------------------------------------------------------
+
+# inv_host_attr SECTION ATTR  -> prints ATTR's value from the first host line in
+# [SECTION], or empty. Host lines look like: `name attr=val attr2=val2`.
+inv_host_attr() {
+    local section="$1" attr="$2"
+    awk -v section="[$section]" -v attr="$attr" '
+        /^[[:space:]]*[;#]/ { next }
+        /^[[:space:]]*\[/   { in_s = ($0 ~ "^[[:space:]]*\\" section "[[:space:]]*$"); next }
+        in_s && NF > 0 {
+            for (i = 1; i <= NF; i++) {
+                eq = index($i, "=")
+                if (eq > 0) {
+                    k = substr($i, 1, eq - 1)
+                    v = substr($i, eq + 1)
+                    if (k == attr) { print v; exit }
+                }
+            }
+            exit   # only the first host line in the section
+        }
+    ' "$INVENTORY"
+}
+
+# inv_var KEY -> prints KEY's value from [dromos:vars] (`key = value`), or empty.
+inv_var() {
+    local key="$1"
+    awk -v key="$key" '
+        /^[[:space:]]*[;#]/ { next }
+        /^[[:space:]]*\[/   { in_s = ($0 ~ /^[[:space:]]*\[dromos:vars\][[:space:]]*$/); next }
+        in_s {
+            line = $0
+            sub(/[;#].*$/, "", line)              # strip trailing comments
+            eq = index(line, "=")
+            if (eq == 0) next
+            k = substr(line, 1, eq - 1)
+            v = substr(line, eq + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            if (k == key) { print v; exit }
+        }
+    ' "$INVENTORY"
+}
+
+PHEBES_HOST=$(inv_host_attr phebes ansible_host)
+PELEON_HOST=$(inv_host_attr peleon ansible_host)
+PHEBES_USER=$(inv_host_attr phebes ansible_user)
+PELEON_USER=$(inv_host_attr peleon ansible_user)
+PHEBES_KEY=$(inv_host_attr phebes ansible_ssh_private_key_file)
+PELEON_KEY=$(inv_host_attr peleon ansible_ssh_private_key_file)
+
+[[ -n "$PHEBES_HOST" ]] || die "could not find ansible_host under [phebes] in $INVENTORY"
+[[ -n "$PELEON_HOST" ]] || die "could not find ansible_host under [peleon] in $INVENTORY"
+
+_v=$(inv_var dromos_backbone_ifname);            [[ -n "$_v" ]] && BACKBONE_IF=$_v
+_v=$(inv_var dromos_client_ifname);              [[ -n "$_v" ]] && CLIENT_IF=$_v
+_v=$(inv_var dromos_backbone_listen_port_peleon);[[ -n "$_v" ]] && BACKBONE_PORT_PELEON=$_v
+# Public address of Peleon for the raw-network probe: prefer the explicit
+# dromos_peleon_host var, fall back to the SSH ansible_host.
+PELEON_PUBLIC=$(inv_var dromos_peleon_host)
+[[ -n "$PELEON_PUBLIC" ]] || PELEON_PUBLIC=$PELEON_HOST
+
+# Per-node SSH user/key precedence: CLI override > inventory > root / none.
+phebes_user=${SSH_USER_OVERRIDE:-${PHEBES_USER:-root}}
+peleon_user=${SSH_USER_OVERRIDE:-${PELEON_USER:-root}}
+phebes_key=${SSH_KEY:-$PHEBES_KEY}
+peleon_key=${SSH_KEY:-$PELEON_KEY}
+
+# ---------------------------------------------------------------------------
+# Output helpers. Track FAILs (only these change the exit code) and WARNs.
+# ---------------------------------------------------------------------------
+fails=0
+warns=0
+ok()      { printf '  [OK]   %s\n' "$*"; }
+fail()    { printf '  [FAIL] %s\n' "$*"; fails=$((fails+1)); }
+warn()    { printf '  [WARN] %s\n' "$*"; warns=$((warns+1)); }
+section() { printf '\n== %s ==\n' "$*"; }
+
+# Show captured command output on failure when --verbose, indented for context.
+show() { (( VERBOSE )) && [[ -n "$1" ]] && printf '%s\n' "$1" | sed 's/^/         | /'; return 0; }
+
+# ssh_run HOST USER KEY 'remote command...' -> runs non-interactively, captures
+# combined output into REPLY (global), returns the remote exit status. Batch
+# mode + connect timeout so an unreachable host fails fast instead of hanging.
+REPLY=""
+ssh_run() {
+    local host="$1" user="$2" key="$3" cmd="$4"
+    local -a opts=(
+        -o BatchMode=yes
+        -o StrictHostKeyChecking=accept-new
+        -o "ConnectTimeout=$SSH_TIMEOUT"
+    )
+    [[ -n "$key" ]] && opts+=(-i "$key")
+    # $cmd is intentionally expanded on the remote host (it is the remote shell
+    # command); local expansion of $cmd's own contents is what we want here.
+    # shellcheck disable=SC2029
+    REPLY=$(ssh "${opts[@]}" "${user}@${host}" "$cmd" 2>&1)
+    return $?
+}
+
+run_phebes() { ssh_run "$PHEBES_HOST" "$phebes_user" "$phebes_key" "$1"; }
+run_peleon() { ssh_run "$PELEON_HOST" "$peleon_user" "$peleon_key" "$1"; }
+
+# Remote snippet (single line so it survives SSH unmodified): source routing.env
+# and classify DROMOS_EGRESS_IF as ok:/missing:/unset on the host. Single-quoted
+# at the call site so $DROMOS_EGRESS_IF expands remotely, not locally.
+# shellcheck disable=SC2016
+EGRESS_PROBE='test -r /etc/dromos/routing.env && . /etc/dromos/routing.env; if [ -n "${DROMOS_EGRESS_IF:-}" ] && ip link show "$DROMOS_EGRESS_IF" >/dev/null 2>&1; then echo "egress-ok:$DROMOS_EGRESS_IF"; elif [ -n "${DROMOS_EGRESS_IF:-}" ]; then echo "egress-missing:$DROMOS_EGRESS_IF"; else echo "egress-unset"; fi'
+
+printf '=== dromos-diagnose ===\n'
+printf 'inventory : %s\n' "$INVENTORY"
+printf 'phebes    : %s@%s\n' "$phebes_user" "$PHEBES_HOST"
+printf 'peleon    : %s@%s (public %s for UDP probe)\n' "$peleon_user" "$PELEON_HOST" "$PELEON_PUBLIC"
+
+# reach HOST_LABEL run_fn  -> SSH reachability + sudo check. Sets the *_REACHABLE
+# global so later sections can skip cleanly when a host is unreachable. Returns 0
+# if reachable. Uses `sudo -n true` to confirm non-interactive privilege without
+# running anything sensitive.
+PHEBES_REACHABLE=0
+PELEON_REACHABLE=0
+check_reach() {
+    local label="$1" runner="$2"
+    if $runner 'echo dromos-ok'; then
+        if [[ "$REPLY" == *dromos-ok* ]]; then
+            ok "$label SSH reachable"
+        else
+            fail "$label SSH connected but returned unexpected output"; show "$REPLY"; return 1
+        fi
+    else
+        fail "$label SSH unreachable"; show "$REPLY"; return 1
+    fi
+    if $runner 'sudo -n true 2>/dev/null && echo sudo-ok || (true; echo sudo-no)'; then
+        if [[ "$REPLY" == *sudo-ok* ]]; then
+            ok "$label sudo (non-interactive) works"
+        else
+            warn "$label sudo -n unavailable (run as root or configure NOPASSWD); privileged checks may be limited"
+        fi
+    fi
+    return 0
+}
+
+# svc LABEL run_fn UNIT  -> is-active check for a systemd unit on a host.
+svc() {
+    local label="$1" runner="$2" unit="$3"
+    if $runner "systemctl is-active --quiet '$unit'"; then
+        ok "$label service active: $unit"
+    else
+        # Distinguish "not installed" from "installed but down" for a better hint.
+        if $runner "systemctl list-unit-files '$unit' 2>/dev/null | grep -q '$unit'"; then
+            fail "$label service NOT active: $unit"
+        else
+            warn "$label service not installed: $unit"
+        fi
+    fi
+}
+
+# healthcheck LABEL run_fn  -> run the host-local probe remotely, surface its
+# exit status, and echo a trimmed tail of its output for context.
+healthcheck() {
+    local label="$1" runner="$2"
+    if $runner 'command -v dromos-healthcheck >/dev/null 2>&1 || test -x /usr/local/sbin/dromos-healthcheck'; then
+        if $runner 'sudo -n dromos-healthcheck 2>&1 || dromos-healthcheck 2>&1'; then
+            ok "$label dromos-healthcheck exited 0 (all green)"
+        else
+            fail "$label dromos-healthcheck reported failures (exit nonzero)"
+        fi
+        # Echo any [FAIL] lines from the probe so the operator sees specifics,
+        # without dumping the whole (verbose) report. Never contains secrets.
+        local bad
+        bad=$(printf '%s\n' "$REPLY" | grep -E '\[FAIL\]' || true)
+        [[ -n "$bad" ]] && printf '%s\n' "$bad" | sed 's/^/         > /'
+        show "$REPLY"
+    else
+        warn "$label dromos-healthcheck not installed; skipping host self-probe"
+    fi
+}
+
+# wg_handshake LABEL run_fn IFACE  -> handshake age + transfer counters + the
+# peer endpoint for a WireGuard interface. FAILs on no/stale handshake or, when
+# a handshake exists, on zero rx/tx (a peer that handshook but moves no data).
+wg_handshake() {
+    local label="$1" runner="$2" iface="$3"
+    if ! $runner "sudo -n wg show '$iface' latest-handshakes 2>/dev/null || wg show '$iface' latest-handshakes 2>/dev/null"; then
+        fail "$label wg show $iface failed (interface down or wg missing)"; show "$REPLY"; return
+    fi
+    local hs
+    hs=$(printf '%s\n' "$REPLY" | awk 'NF>=2 {print $2; exit}')
+    if [[ -z "$hs" || "$hs" == "0" ]]; then
+        fail "$label $iface: no handshake yet (peer unreachable or wrong key)"; return
+    fi
+    local now age
+    now=$(date +%s)
+    age=$(( now - hs ))
+    if (( age < 180 )); then
+        ok "$label $iface handshake age ${age}s"
+    else
+        fail "$label $iface handshake STALE (${age}s; expected < 180s)"
+    fi
+
+    # Peer endpoint (host:port) -- proves where the tunnel actually connects.
+    if $runner "sudo -n wg show '$iface' endpoints 2>/dev/null || wg show '$iface' endpoints 2>/dev/null"; then
+        local ep
+        ep=$(printf '%s\n' "$REPLY" | awk 'NF>=2 {print $2; exit}')
+        if [[ -n "$ep" && "$ep" != "(none)" ]]; then
+            ok "$label $iface peer endpoint $ep"
+        else
+            warn "$label $iface has no peer endpoint set"
+        fi
+    fi
+
+    # Transfer counters: a fresh handshake with zero bytes both ways means the
+    # control plane is up but no data is flowing -- worth a FAIL when we just
+    # confirmed a recent handshake.
+    if $runner "sudo -n wg show '$iface' transfer 2>/dev/null || wg show '$iface' transfer 2>/dev/null"; then
+        local rx tx
+        rx=$(printf '%s\n' "$REPLY" | awk 'NF>=3 {print $2; exit}')
+        tx=$(printf '%s\n' "$REPLY" | awk 'NF>=3 {print $3; exit}')
+        rx=${rx:-0}; tx=${tx:-0}
+        if (( rx == 0 && tx == 0 )); then
+            fail "$label $iface transfer counters both zero (rx=0 tx=0) despite handshake"
+        else
+            ok "$label $iface transfer rx=${rx}B tx=${tx}B"
+        fi
+    fi
+}
+
+# ===========================================================================
+# 1. PHEBES HOST
+# ===========================================================================
+section "Phebes host ($PHEBES_HOST)"
+if check_reach "Phebes" run_phebes; then
+    PHEBES_REACHABLE=1
+    svc "Phebes" run_phebes "wg-quick@$BACKBONE_IF"
+    svc "Phebes" run_phebes "wg-quick@$CLIENT_IF"
+    svc "Phebes" run_phebes "dromos-nft.service"
+    svc "Phebes" run_phebes "dromos-geo-update.timer"
+    # routing.env present and names an egress interface that exists on the host.
+    if run_phebes "$EGRESS_PROBE"; then
+        case "$REPLY" in
+            egress-ok:*)      ok "Phebes egress interface ${REPLY#egress-ok:} present (from routing.env)" ;;
+            egress-missing:*) fail "Phebes routing.env egress ${REPLY#egress-missing:} does not exist on host" ;;
+            *)                warn "Phebes routing.env has no DROMOS_EGRESS_IF (relying on runtime auto-detect)" ;;
+        esac
+    else
+        warn "Phebes /etc/dromos/routing.env unreadable"
+    fi
+    healthcheck "Phebes" run_phebes
+fi
+
+# ===========================================================================
+# 2. PELEON HOST
+# ===========================================================================
+section "Peleon host ($PELEON_HOST)"
+if check_reach "Peleon" run_peleon; then
+    PELEON_REACHABLE=1
+    svc "Peleon" run_peleon "wg-quick@$BACKBONE_IF"
+    svc "Peleon" run_peleon "dromos-nft.service"
+    if run_peleon "$EGRESS_PROBE"; then
+        case "$REPLY" in
+            egress-ok:*)      ok "Peleon egress interface ${REPLY#egress-ok:} present (from routing.env)" ;;
+            egress-missing:*) fail "Peleon routing.env egress ${REPLY#egress-missing:} does not exist on host" ;;
+            *)                warn "Peleon routing.env has no DROMOS_EGRESS_IF (relying on runtime auto-detect)" ;;
+        esac
+    else
+        warn "Peleon /etc/dromos/routing.env unreadable"
+    fi
+    # UFW route (forward) allow for backbone -> egress, only when UFW is active.
+    if run_peleon 'sudo -n ufw status 2>/dev/null || ufw status 2>/dev/null'; then
+        if printf '%s\n' "$REPLY" | grep -qi 'Status: active'; then
+            if printf '%s\n' "$REPLY" | grep -qiE "Anywhere.*on $BACKBONE_IF|$BACKBONE_IF .*ALLOW FWD|route.*$BACKBONE_IF"; then
+                ok "Peleon UFW route allow for $BACKBONE_IF present"
+            else
+                # `ufw status` formatting varies; confirm via the route ruleset.
+                if run_peleon "sudo -n ufw show added 2>/dev/null | grep -qi 'route allow in on $BACKBONE_IF'"; then
+                    ok "Peleon UFW route allow in on $BACKBONE_IF present"
+                else
+                    fail "Peleon UFW active but no route allow for $BACKBONE_IF (forwarded traffic may be dropped)"
+                fi
+            fi
+        else
+            ok "Peleon UFW inactive (no route-allow needed)"
+        fi
+    else
+        warn "Peleon UFW status unavailable; cannot verify route allow"
+    fi
+    healthcheck "Peleon" run_peleon
+fi
+
+# ===========================================================================
+# 3. RAW NETWORK: Phebes -> Peleon public UDP 51821
+# ===========================================================================
+if (( DO_NETWORK )); then
+    section "Phebes <-> Peleon raw network (UDP/$BACKBONE_PORT_PELEON)"
+    if (( ! PHEBES_REACHABLE )); then
+        warn "Phebes unreachable; skipping raw-network probe"
+    else
+        # Non-invasive UDP send from Phebes using Python (no nc dependency). A
+        # UDP send "succeeding" only proves the local stack accepted it, so we
+        # also try to confirm arrival on Peleon with tcpdump IF it is already
+        # installed -- we never install it. Missing tcpdump => [WARN] skipped.
+        peleon_has_tcpdump=0
+        if (( PELEON_REACHABLE )) && run_peleon 'command -v tcpdump >/dev/null 2>&1'; then
+            peleon_has_tcpdump=1
+        fi
+
+        if (( peleon_has_tcpdump )); then
+            # Start a short bounded capture on Peleon, fire 3 UDP datagrams from
+            # Phebes, then read the capture count. tcpdump auto-exits via -c/-W.
+            run_peleon "sudo -n timeout 6 tcpdump -ni any udp port $BACKBONE_PORT_PELEON -c 3 >/tmp/dromos-diag-cap.\$\$ 2>&1 & echo \$!" >/dev/null
+            cap_pid=$REPLY
+            sleep 1
+            run_phebes "python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+for _ in range(3):
+    try:
+        s.sendto(b'dromos-diagnose-probe', ('$PELEON_PUBLIC', $BACKBONE_PORT_PELEON))
+    except OSError as e:
+        print('send-error', e); break
+else:
+    print('sent-ok')
+PY" >/dev/null
+            if [[ "$REPLY" == *sent-ok* ]]; then
+                ok "Phebes sent UDP probe to $PELEON_PUBLIC:$BACKBONE_PORT_PELEON"
+            else
+                fail "Phebes could not send UDP to $PELEON_PUBLIC:$BACKBONE_PORT_PELEON"; show "$REPLY"
+            fi
+            sleep 2
+            run_peleon "cat /tmp/dromos-diag-cap.$cap_pid 2>/dev/null; rm -f /tmp/dromos-diag-cap.$cap_pid 2>/dev/null"
+            if printf '%s\n' "$REPLY" | grep -qE "\.$BACKBONE_PORT_PELEON"; then
+                ok "Peleon observed inbound UDP on :$BACKBONE_PORT_PELEON (raw path open)"
+            else
+                # WireGuard traffic is constant, so an empty capture during the
+                # window is a genuine red flag for the public UDP path.
+                fail "Peleon saw NO inbound UDP on :$BACKBONE_PORT_PELEON (firewall/SG/route blocking the public path?)"
+            fi
+        else
+            # Send-only: still useful (a routing/ICMP error surfaces here), but
+            # we can't confirm arrival without a capture tool on Peleon.
+            run_phebes "python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+try:
+    s.sendto(b'dromos-diagnose-probe', ('$PELEON_PUBLIC', $BACKBONE_PORT_PELEON))
+    print('sent-ok')
+except OSError as e:
+    print('send-error', e)
+PY"
+            if [[ "$REPLY" == *sent-ok* ]]; then
+                ok "Phebes sent UDP probe to $PELEON_PUBLIC:$BACKBONE_PORT_PELEON"
+                warn "tcpdump not installed on Peleon; cannot confirm arrival. Install with 'apt-get install -y tcpdump' on Peleon to enable the arrival check, or rely on the WireGuard handshake below."
+            else
+                fail "Phebes could not send UDP to $PELEON_PUBLIC:$BACKBONE_PORT_PELEON"; show "$REPLY"
+            fi
+        fi
+    fi
+fi
+
+# ===========================================================================
+# 4. WIREGUARD: backbone handshake on both ends + backbone-IP ping both ways
+# ===========================================================================
+section "Phebes <-> Peleon WireGuard backbone"
+if (( PHEBES_REACHABLE )); then
+    wg_handshake "Phebes" run_phebes "$BACKBONE_IF"
+    # Phebes -> Peleon over the backbone tunnel IPs (10.77.0.2 by default).
+    if run_phebes "ping -c1 -W2 -I '$BACKBONE_IF' '$PELEON_BACKBONE_ADDR' >/dev/null 2>&1"; then
+        ok "Phebes ping $PELEON_BACKBONE_ADDR via $BACKBONE_IF OK"
+    else
+        fail "Phebes cannot ping $PELEON_BACKBONE_ADDR via $BACKBONE_IF (backbone down)"
+    fi
+else
+    warn "Phebes unreachable; skipping Phebes-side WireGuard checks"
+fi
+if (( PELEON_REACHABLE )); then
+    wg_handshake "Peleon" run_peleon "$BACKBONE_IF"
+    if run_peleon "ping -c1 -W2 -I '$BACKBONE_IF' '$PHEBES_BACKBONE_ADDR' >/dev/null 2>&1"; then
+        ok "Peleon ping $PHEBES_BACKBONE_ADDR via $BACKBONE_IF OK"
+    else
+        fail "Peleon cannot ping $PHEBES_BACKBONE_ADDR via $BACKBONE_IF (backbone down)"
+    fi
+else
+    warn "Peleon unreachable; skipping Peleon-side WireGuard checks"
+fi
+
+# ===========================================================================
+# 5. CLIENT PATH READINESS (Phebes only): client iface up + policy routing
+# ===========================================================================
+if (( DO_CLIENT )); then
+    section "Client path readiness (Phebes)"
+    if (( ! PHEBES_REACHABLE )); then
+        warn "Phebes unreachable; skipping client-path checks"
+    else
+        if run_phebes "ip link show '$CLIENT_IF' 2>/dev/null | grep -q 'state UNKNOWN\|state UP'"; then
+            ok "Phebes $CLIENT_IF is up"
+        else
+            fail "Phebes $CLIENT_IF down or missing (clients cannot connect)"
+        fi
+        # Geobase non-empty: the RU ipset must be populated or RU-direct routing
+        # silently sends RU traffic out Peleon. >100 entries mirrors healthcheck.
+        if run_phebes "sudo -n nft list set inet dromos dromos_ru4 2>/dev/null || nft list set inet dromos dromos_ru4 2>/dev/null"; then
+            cnt=$(printf '%s\n' "$REPLY" | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' || true)
+            if (( cnt > 100 )); then
+                ok "Phebes geobase ipset dromos_ru4 populated ($cnt entries)"
+            else
+                fail "Phebes geobase ipset dromos_ru4 nearly empty ($cnt entries; run dromos-geo-update)"
+            fi
+        else
+            warn "Phebes could not read nft set dromos_ru4 (need sudo?)"
+        fi
+        # Policy rules present: both fwmark -> table rules must exist or marked
+        # traffic falls back to the main table. Match name or numeric id form.
+        if run_phebes "ip rule show 2>/dev/null | grep -qiE 'fwmark 0x42\b'"; then
+            ok "Phebes policy rule for fwmark 0x42 present"
+        else
+            fail "Phebes policy rule for fwmark 0x42 missing (RU routing broken)"
+        fi
+        if run_phebes "ip rule show 2>/dev/null | grep -qiE 'fwmark 0x43\b'"; then
+            ok "Phebes policy rule for fwmark 0x43 present"
+        else
+            fail "Phebes policy rule for fwmark 0x43 missing (foreign routing broken)"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+section "Summary"
+if (( fails > 0 )); then
+    printf '  %d FAIL, %d WARN -- the two-hop path is NOT fully healthy.\n' "$fails" "$warns"
+    exit 1
+fi
+if (( warns > 0 )); then
+    printf '  0 FAIL, %d WARN -- healthy, with non-fatal warnings above.\n' "$warns"
+else
+    printf '  All checks passed. Phebes, Peleon, the raw network, and WireGuard are healthy.\n'
+fi
+exit 0

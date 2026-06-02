@@ -119,6 +119,25 @@ probes are skipped there rather than reported as misleading failures.
 
 Exit code 0 on all OK; non-zero with summary on any failure. Suitable for monitoring.
 
+### Whole-path diagnostics from the control machine
+
+`dromos-healthcheck` runs *on a host* and answers "is this host healthy?".
+`dromos-diagnose` runs *from your workstation* against the inventory and answers
+"is the whole two-hop path healthy, and if not, which hop/layer is broken?". It
+reaches both nodes over SSH, runs `dromos-healthcheck` remotely on each, and adds
+cross-host checks the host-local probe can't do (the raw Phebes→Peleon UDP path,
+both-ends handshake/counter comparison, Peleon's UFW route-allow):
+
+```bash
+scripts/dromos-diagnose -i ansible/inventory/prod.ini
+```
+
+It is read-only and non-invasive (never edits hosts, installs packages, or
+restarts services) and never prints private keys or client configs. Exit code 0
+when green (warnings allowed), 1 on any FAIL. See
+[docs/troubleshooting.md](troubleshooting.md#start-here-dromos-diagnose-whole-path-check-from-your-workstation)
+for how to read the output, and `scripts/dromos-diagnose --help` for flags.
+
 ## Logs
 
 | What                | Where                                    |

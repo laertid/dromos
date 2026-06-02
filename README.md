@@ -60,7 +60,7 @@ This gives users a Russian IP for Russian services (banking, gov, content geo-lo
 │       ├── phebes/            client-facing WG, geo-routing, SS, OVPN
 │       └── peleon/            backbone WG, exit NAT
 ├── templates/                 Jinja2 templates for WG/SS/OVPN/nftables
-├── scripts/                   user-add/remove/list, geo-update, backup/restore, healthcheck
+├── scripts/                   user-add/remove/list, geo-update, backup/restore, healthcheck, diagnose
 └── tests/
     ├── lab/                   Docker-compose lab (client→phebes→peleon→dst)
     └── unit/                  Python tests for geobase / config rendering
@@ -88,10 +88,15 @@ scripts/dromos-init-inventory
 # Run from the repo root: the ansible.cfg there points roles_path at ansible/roles.
 ansible-playbook -i ansible/inventory/prod.ini ansible/playbooks/site.yml
 
-# 3. Add a user (on Phebes). Prints a secret-free summary + the config path.
+# 3. Verify the whole two-hop path from your workstation (reaches both nodes
+#    over SSH via the inventory; read-only, prints no secrets). Use this first
+#    whenever something is off — it tells you which hop/layer is broken.
+scripts/dromos-diagnose -i ansible/inventory/prod.ini
+
+# 4. Add a user (on Phebes). Prints a secret-free summary + the config path.
 scripts/dromos-user add alice
 
-# 4. Retrieve the full WG config to hand to alice (contains private + preshared
+# 5. Retrieve the full WG config to hand to alice (contains private + preshared
 #    keys, so it is not printed by default):
 scripts/dromos-user show alice
 #    or: sudo cat /etc/dromos/secrets/clients/alice/alice.conf
