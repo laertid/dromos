@@ -161,6 +161,12 @@ fail()    { printf '  [FAIL] %s\n' "$*"; fails=$((fails+1)); }
 warn()    { printf '  [WARN] %s\n' "$*"; warns=$((warns+1)); }
 section() { printf '\n== %s ==\n' "$*"; }
 
+# Set when the raw synthetic-UDP capture saw nothing. Its verdict is deferred
+# until after the WireGuard backbone section: real WG data over the same public
+# UDP path is stronger proof than a flaky tcpdump capture, so a healthy backbone
+# downgrades this to a WARN. Resolved just after the WireGuard section.
+RAW_UDP_UNCONFIRMED=0
+
 # Show captured command output on failure when --verbose, indented for context.
 show() { (( VERBOSE )) && [[ -n "$1" ]] && printf '%s\n' "$1" | sed 's/^/         | /'; return 0; }
 
@@ -186,11 +192,19 @@ ssh_run() {
 run_phebes() { ssh_run "$PHEBES_HOST" "$phebes_user" "$phebes_key" "$1"; }
 run_peleon() { ssh_run "$PELEON_HOST" "$peleon_user" "$peleon_key" "$1"; }
 
-# Remote snippet (single line so it survives SSH unmodified): source routing.env
-# and classify DROMOS_EGRESS_IF as ok:/missing:/unset on the host. Single-quoted
-# at the call site so $DROMOS_EGRESS_IF expands remotely, not locally.
+# Remote snippet (single line so it survives SSH unmodified): read the
+# DROMOS_EGRESS_IF assignment out of routing.env and classify it as
+# ok:/missing:/unset on the host. Single-quoted at the call site so $eif and
+# friends expand remotely, not locally.
+#
+# We parse the file directly rather than `. routing.env`: sourcing was fragile
+# (a stray pre-set/exported DROMOS_EGRESS_IF in the SSH session's environment,
+# or a non-sh-safe line earlier in the file, could leave the value empty and
+# trip the "unset" branch even though the file clearly sets it). The sed picks
+# the last `DROMOS_EGRESS_IF=...` line (ignoring comments), strips an optional
+# `export `, surrounding quotes, inline comments, a trailing CR, and whitespace.
 # shellcheck disable=SC2016
-EGRESS_PROBE='test -r /etc/dromos/routing.env && . /etc/dromos/routing.env; if [ -n "${DROMOS_EGRESS_IF:-}" ] && ip link show "$DROMOS_EGRESS_IF" >/dev/null 2>&1; then echo "egress-ok:$DROMOS_EGRESS_IF"; elif [ -n "${DROMOS_EGRESS_IF:-}" ]; then echo "egress-missing:$DROMOS_EGRESS_IF"; else echo "egress-unset"; fi'
+EGRESS_PROBE='if [ -r /etc/dromos/routing.env ]; then eif=$(sed -n "s/^[[:space:]]*\(export[[:space:]]\+\)\?DROMOS_EGRESS_IF[[:space:]]*=[[:space:]]*//p" /etc/dromos/routing.env | tail -n1 | sed -e "s/[[:space:]]*#.*$//" -e "s/^\"\(.*\)\"$/\1/" -e "s/^'\''\(.*\)'\''$/\1/" -e "s/\r$//" -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//"); if [ -n "$eif" ] && ip link show "$eif" >/dev/null 2>&1; then echo "egress-ok:$eif"; elif [ -n "$eif" ]; then echo "egress-missing:$eif"; else echo "egress-unset"; fi; else echo "egress-noenv"; fi'
 
 printf '=== dromos-diagnose ===\n'
 printf 'inventory : %s\n' "$INVENTORY"
@@ -324,10 +338,11 @@ if check_reach "Phebes" run_phebes; then
         case "$REPLY" in
             egress-ok:*)      ok "Phebes egress interface ${REPLY#egress-ok:} present (from routing.env)" ;;
             egress-missing:*) fail "Phebes routing.env egress ${REPLY#egress-missing:} does not exist on host" ;;
+            egress-noenv)     warn "Phebes /etc/dromos/routing.env unreadable" ;;
             *)                warn "Phebes routing.env has no DROMOS_EGRESS_IF (relying on runtime auto-detect)" ;;
         esac
     else
-        warn "Phebes /etc/dromos/routing.env unreadable"
+        warn "Phebes /etc/dromos/routing.env probe failed"
     fi
     healthcheck "Phebes" run_phebes
 fi
@@ -344,10 +359,11 @@ if check_reach "Peleon" run_peleon; then
         case "$REPLY" in
             egress-ok:*)      ok "Peleon egress interface ${REPLY#egress-ok:} present (from routing.env)" ;;
             egress-missing:*) fail "Peleon routing.env egress ${REPLY#egress-missing:} does not exist on host" ;;
+            egress-noenv)     warn "Peleon /etc/dromos/routing.env unreadable" ;;
             *)                warn "Peleon routing.env has no DROMOS_EGRESS_IF (relying on runtime auto-detect)" ;;
         esac
     else
-        warn "Peleon /etc/dromos/routing.env unreadable"
+        warn "Peleon /etc/dromos/routing.env probe failed"
     fi
     # UFW route (forward) allow for backbone -> egress, only when UFW is active.
     if run_peleon 'sudo -n ufw status 2>/dev/null || ufw status 2>/dev/null'; then
@@ -416,9 +432,14 @@ PY" >/dev/null
             if printf '%s\n' "$REPLY" | grep -qE "\.$BACKBONE_PORT_PELEON"; then
                 ok "Peleon observed inbound UDP on :$BACKBONE_PORT_PELEON (raw path open)"
             else
-                # WireGuard traffic is constant, so an empty capture during the
-                # window is a genuine red flag for the public UDP path.
-                fail "Peleon saw NO inbound UDP on :$BACKBONE_PORT_PELEON (firewall/SG/route blocking the public path?)"
+                # An empty capture is suspicious, but synthetic tcpdump capture is
+                # timing/filter-sensitive and can miss our short probe burst even
+                # when the path is fine. WireGuard data flowing over the same
+                # public UDP path is far stronger evidence. So defer the verdict:
+                # if the backbone WG checks below are healthy, this becomes a WARN
+                # (capture inconclusive); only if WG is *also* unhealthy do we turn
+                # it into a FAIL. Resolved after the WireGuard section.
+                RAW_UDP_UNCONFIRMED=1
             fi
         else
             # Send-only: still useful (a routing/ICMP error surfaces here), but
@@ -447,6 +468,11 @@ fi
 # 4. WIREGUARD: backbone handshake on both ends + backbone-IP ping both ways
 # ===========================================================================
 section "Phebes <-> Peleon WireGuard backbone"
+# Snapshot the FAIL count so we can tell whether the backbone section itself
+# stayed clean -- the deferred raw-UDP verdict below keys off this. A clean WG
+# backbone (recent handshakes, nonzero counters, ping) proves the public UDP
+# path well enough to forgive an inconclusive synthetic capture.
+_wg_fails_before=$fails
 if (( PHEBES_REACHABLE )); then
     wg_handshake "Phebes" run_phebes "$BACKBONE_IF"
     # Phebes -> Peleon over the backbone tunnel IPs (10.77.0.2 by default).
@@ -467,6 +493,25 @@ if (( PELEON_REACHABLE )); then
     fi
 else
     warn "Peleon unreachable; skipping Peleon-side WireGuard checks"
+fi
+
+# WG backbone is healthy only if it was reachable on at least one side AND added
+# no FAILs of its own.
+wg_backbone_healthy=0
+if (( (PHEBES_REACHABLE || PELEON_REACHABLE) && fails == _wg_fails_before )); then
+    wg_backbone_healthy=1
+fi
+
+# Resolve the deferred raw synthetic-UDP verdict now that WG health is known.
+# Healthy backbone -> the public UDP path demonstrably works, so an empty
+# capture is just a flaky/timed-out probe: WARN. Unhealthy backbone -> we have
+# no other evidence the path works, so the empty capture stands as a FAIL.
+if (( RAW_UDP_UNCONFIRMED )); then
+    if (( wg_backbone_healthy )); then
+        warn "Peleon saw no inbound UDP on :$BACKBONE_PORT_PELEON during the synthetic probe, but the WireGuard backbone is healthy over that same public UDP path (recent handshake + ping) -- treating the capture as inconclusive, not a path failure"
+    else
+        fail "Peleon saw NO inbound UDP on :$BACKBONE_PORT_PELEON and the WireGuard backbone is also unhealthy (firewall/SG/route blocking the public path?)"
+    fi
 fi
 
 # ===========================================================================

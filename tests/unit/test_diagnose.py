@@ -78,8 +78,12 @@ if [[ "$cmd" == *is-active* ]]; then
 fi
 if [[ "$cmd" == *list-unit-files* ]]; then emit "$cmd"; exit 0; fi
 
-# routing.env egress probe.
+# routing.env egress probe. The real probe classifies the host's
+# DROMOS_EGRESS_IF as egress-ok/egress-missing/egress-unset/egress-noenv; the
+# stub mirrors those tokens so the script's case-handling is exercised.
 if [[ "$cmd" == *routing.env* ]]; then
+  if [[ "${EGRESS_NOENV:-0}" == "1" ]]; then emit "egress-noenv"; exit 0; fi
+  if [[ "${EGRESS_UNSET:-0}" == "1" ]]; then emit "egress-unset"; exit 0; fi
   emit "egress-ok:${EGRESS_IF:-enx5}"; exit 0
 fi
 
@@ -122,6 +126,9 @@ if [[ "$cmd" == *"command -v tcpdump"* ]]; then
 fi
 if [[ "$cmd" == *tcpdump* ]]; then emit "$!"; exit 0; fi   # capture launcher
 if [[ "$cmd" == *dromos-diag-cap* ]]; then
+  # An empty capture (NO_INBOUND_UDP=1) simulates a flaky/timed-out tcpdump that
+  # caught none of the synthetic probe burst, even on a healthy path.
+  if [[ "${NO_INBOUND_UDP:-0}" == "1" ]]; then exit 0; fi
   emit "12:00:00.0 IP a.b.c.d.40000 > e.f.g.h.51821: UDP, length 20"; exit 0
 fi
 
@@ -289,6 +296,60 @@ def test_missing_tcpdump_warns_and_does_not_fail_path(tmp_path):
 def test_skip_network_skips_raw_section(tmp_path):
     res = _run(tmp_path, extra_args=("--skip-network",))
     assert "== Phebes <-> Peleon raw network" not in res.stdout
+
+
+# --- raw UDP capture verdict is deferred to WireGuard health ---------------
+
+def test_empty_capture_warns_when_wireguard_healthy(tmp_path):
+    # tcpdump is present but caught nothing, yet the WireGuard backbone is fully
+    # healthy (recent handshake, nonzero counters, ping). A flaky synthetic
+    # capture must NOT fail the run when real WG data proves the public path.
+    res = _run(
+        tmp_path,
+        PELEON_TCPDUMP="1", NO_INBOUND_UDP="1",
+        UFW_ACTIVE="1", UFW_ROUTE_ALLOW="1",
+    )
+    assert "saw no inbound UDP" in res.stdout, res.stdout
+    assert "treating the capture as inconclusive" in res.stdout, res.stdout
+    # Downgraded to WARN -> no FAIL from the raw section, run still exits 0.
+    assert "[FAIL]" not in res.stdout, res.stdout
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_empty_capture_fails_when_wireguard_also_unhealthy(tmp_path):
+    # Both the synthetic capture AND the WireGuard backbone are unhealthy: with
+    # no evidence the public path works, the empty capture stands as a FAIL.
+    res = _run(
+        tmp_path,
+        PELEON_TCPDUMP="1", NO_INBOUND_UDP="1", NO_HANDSHAKE="1",
+    )
+    assert "saw NO inbound UDP" in res.stdout, res.stdout
+    assert "WireGuard backbone is also unhealthy" in res.stdout, res.stdout
+    assert res.returncode == 1, res.stdout + res.stderr
+
+
+# --- routing.env egress classification -------------------------------------
+
+def test_egress_noenv_warns_not_fail(tmp_path):
+    res = _run(tmp_path, EGRESS_NOENV="1", PELEON_TCPDUMP="1",
+               UFW_ACTIVE="1", UFW_ROUTE_ALLOW="1")
+    assert "routing.env unreadable" in res.stdout, res.stdout
+    assert "[FAIL]" not in res.stdout, res.stdout
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_egress_unset_warns_not_fail(tmp_path):
+    res = _run(tmp_path, EGRESS_UNSET="1", PELEON_TCPDUMP="1",
+               UFW_ACTIVE="1", UFW_ROUTE_ALLOW="1")
+    assert "has no DROMOS_EGRESS_IF" in res.stdout, res.stdout
+    assert "[FAIL]" not in res.stdout, res.stdout
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_egress_ok_reports_interface(tmp_path):
+    res = _run(tmp_path, EGRESS_IF="eth0", PELEON_TCPDUMP="1",
+               UFW_ACTIVE="1", UFW_ROUTE_ALLOW="1")
+    assert "egress interface eth0 present" in res.stdout, res.stdout
 
 
 # --- safety: never prints secrets ------------------------------------------
