@@ -191,6 +191,36 @@
   failed_when: false
   when: dromos_deadman_enabled | default(true) | bool
 
+# Flush any pending reload handlers now so wg-quick PostUp hooks (which call
+# `dromos-routing apply ...`) have run before we explicitly reassert routing.
+- name: Flush handlers before asserting policy routing
+  ansible.builtin.meta: flush_handlers
+
+# Explicitly (re)apply Dromos policy routing. wg-quick PostUp hooks only run
+# `dromos-routing apply` when a unit actually (re)starts; on a converged host
+# where the units are already up and unchanged, no handler fires and the fwmark
+# policy rules + custom tables can silently drift away (observed live: rules
+# missing while WG was active, healthcheck red until a manual apply). Running it
+# here every converge keeps `site.yml` self-healing. dromos-routing is
+# idempotent and touches only Dromos-owned rules/tables -- never sshd or the
+# host default route -- so reasserting it is safe. Gated on the interface
+# existing so a partial bringup does not error.
+- name: Assert Dromos client policy routing (idempotent)
+  ansible.builtin.command:
+    cmd: /usr/local/sbin/dromos-routing apply client
+  register: _dromos_apply_client
+  changed_when: false
+  failed_when: false
+  when: dromos_routing_assert | default(true) | bool
+
+- name: Assert Dromos backbone policy routing (idempotent)
+  ansible.builtin.command:
+    cmd: /usr/local/sbin/dromos-routing apply backbone
+  register: _dromos_apply_backbone
+  changed_when: false
+  failed_when: false
+  when: dromos_routing_assert | default(true) | bool
+
 - name: Install geo-update script + timer
   ansible.builtin.copy:
     src: "{{ playbook_dir }}/../../scripts/dromos-geo-update"

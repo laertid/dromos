@@ -38,12 +38,26 @@ DROMOS_TABLE_FOREIGN="${DROMOS_TABLE_FOREIGN:-101}"
 
 log() { printf '[dromos-routing] %s\n' "$*" >&2; }
 
+DROMOS_RT_TABLES="${DROMOS_RT_TABLES:-/etc/iproute2/rt_tables}"
+
 ensure_rt_tables() {
-    local f=/etc/iproute2/rt_tables
+    local f="$DROMOS_RT_TABLES"
     grep -q "^${DROMOS_TABLE_RU}[[:space:]]*dromos_ru$" "$f" 2>/dev/null \
         || echo "${DROMOS_TABLE_RU}    dromos_ru" >> "$f"
     grep -q "^${DROMOS_TABLE_FOREIGN}[[:space:]]*dromos_foreign$" "$f" 2>/dev/null \
         || echo "${DROMOS_TABLE_FOREIGN}    dromos_foreign" >> "$f"
+}
+
+# Resolve a table id to its rt_tables alias (e.g. 100 -> dromos_ru), or empty.
+# Once ensure_rt_tables has run, `ip rule show` prints the alias rather than the
+# numeric id, so idempotency checks must look for either form.
+rt_table_name() {
+    local id="$1"
+    awk -v id="$id" '
+        /^[[:space:]]*#/ {next}
+        $1 == id {print $2; found=1; exit}
+        END {if(!found) exit 1}
+    ' "$DROMOS_RT_TABLES" 2>/dev/null
 }
 
 # Get the host's current default-route gateway, without touching it.
@@ -54,11 +68,18 @@ host_default_gw() {
 # Add an `ip rule` only if an equivalent fwmark->table rule is absent.
 # Matching on the (fwmark, table) pair keeps this idempotent regardless of how
 # `ip rule show` spaces or normalises the line (e.g. "0x42" vs "0x00000042").
+# The table is matched on either its numeric id or its rt_tables alias, because
+# once ensure_rt_tables has installed 100->dromos_ru / 101->dromos_foreign,
+# `ip rule show` prints "lookup dromos_ru" rather than "lookup 100" -- matching
+# only the numeric id would re-add a duplicate rule on every apply.
 rule_add_idempotent() {
     local mark="$1" table="$2"
-    local mark_norm
+    local mark_norm name table_pat
     mark_norm=$(printf '%#x' "$mark")   # normalise 0x42 / 66 -> 0x42
-    if ! ip rule show | grep -Eiq "fwmark (${mark}|${mark_norm})\b.*lookup ${table}\b"; then
+    name=$(rt_table_name "$table" || true)
+    table_pat="$table"
+    [[ -n "$name" ]] && table_pat="(${table}|${name})"
+    if ! ip rule show | grep -Eiq "fwmark (${mark}|${mark_norm})\b.*lookup ${table_pat}\b"; then
         ip rule add fwmark "$mark" lookup "$table"
     fi
 }
