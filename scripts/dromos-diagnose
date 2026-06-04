@@ -203,8 +203,16 @@ run_peleon() { ssh_run "$PELEON_HOST" "$peleon_user" "$peleon_key" "$1"; }
 # trip the "unset" branch even though the file clearly sets it). The sed picks
 # the last `DROMOS_EGRESS_IF=...` line (ignoring comments), strips an optional
 # `export `, surrounding quotes, inline comments, a trailing CR, and whitespace.
+#
+# The file is read through a `cat` that prefers `sudo -n`: /etc/dromos is mode
+# 0750 root:root, so a non-root SSH user cannot even traverse into it and a plain
+# `[ -r /etc/dromos/routing.env ]` is false on a perfectly healthy host -- that
+# produced a spurious "routing.env unreadable" warning even though the file is
+# 0644 and clearly sets DROMOS_EGRESS_IF. Reading via sudo (falling back to a
+# plain cat when already root or sudo is unavailable) classifies "no privilege to
+# read" (egress-noperm) distinctly from "file genuinely absent" (egress-noenv).
 # shellcheck disable=SC2016
-EGRESS_PROBE='if [ -r /etc/dromos/routing.env ]; then eif=$(sed -n "s/^[[:space:]]*\(export[[:space:]]\+\)\?DROMOS_EGRESS_IF[[:space:]]*=[[:space:]]*//p" /etc/dromos/routing.env | tail -n1 | sed -e "s/[[:space:]]*#.*$//" -e "s/^\"\(.*\)\"$/\1/" -e "s/^'\''\(.*\)'\''$/\1/" -e "s/\r$//" -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//"); if [ -n "$eif" ] && ip link show "$eif" >/dev/null 2>&1; then echo "egress-ok:$eif"; elif [ -n "$eif" ]; then echo "egress-missing:$eif"; else echo "egress-unset"; fi; else echo "egress-noenv"; fi'
+EGRESS_PROBE='f=/etc/dromos/routing.env; raw=$(sudo -n cat "$f" 2>/dev/null || cat "$f" 2>/dev/null); st=$?; if [ -n "$raw" ]; then eif=$(printf "%s\n" "$raw" | sed -n "s/^[[:space:]]*\(export[[:space:]]\+\)\?DROMOS_EGRESS_IF[[:space:]]*=[[:space:]]*//p" | tail -n1 | sed -e "s/[[:space:]]*#.*$//" -e "s/^\"\(.*\)\"$/\1/" -e "s/^'\''\(.*\)'\''$/\1/" -e "s/\r$//" -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//"); if [ -n "$eif" ] && ip link show "$eif" >/dev/null 2>&1; then echo "egress-ok:$eif"; elif [ -n "$eif" ]; then echo "egress-missing:$eif"; else echo "egress-unset"; fi; elif sudo -n test -e "$f" 2>/dev/null || [ -e "$f" ]; then echo "egress-noperm"; else echo "egress-noenv"; fi'
 
 printf '=== dromos-diagnose ===\n'
 printf 'inventory : %s\n' "$INVENTORY"
@@ -338,7 +346,8 @@ if check_reach "Phebes" run_phebes; then
         case "$REPLY" in
             egress-ok:*)      ok "Phebes egress interface ${REPLY#egress-ok:} present (from routing.env)" ;;
             egress-missing:*) fail "Phebes routing.env egress ${REPLY#egress-missing:} does not exist on host" ;;
-            egress-noenv)     warn "Phebes /etc/dromos/routing.env unreadable" ;;
+            egress-noperm)    warn "Phebes /etc/dromos/routing.env present but not readable as $phebes_user (need sudo -n / root)" ;;
+            egress-noenv)     warn "Phebes /etc/dromos/routing.env not found" ;;
             *)                warn "Phebes routing.env has no DROMOS_EGRESS_IF (relying on runtime auto-detect)" ;;
         esac
     else
@@ -359,7 +368,8 @@ if check_reach "Peleon" run_peleon; then
         case "$REPLY" in
             egress-ok:*)      ok "Peleon egress interface ${REPLY#egress-ok:} present (from routing.env)" ;;
             egress-missing:*) fail "Peleon routing.env egress ${REPLY#egress-missing:} does not exist on host" ;;
-            egress-noenv)     warn "Peleon /etc/dromos/routing.env unreadable" ;;
+            egress-noperm)    warn "Peleon /etc/dromos/routing.env present but not readable as $peleon_user (need sudo -n / root)" ;;
+            egress-noenv)     warn "Peleon /etc/dromos/routing.env not found" ;;
             *)                warn "Peleon routing.env has no DROMOS_EGRESS_IF (relying on runtime auto-detect)" ;;
         esac
     else

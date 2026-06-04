@@ -41,6 +41,14 @@ dromos_table_foreign: 101
 # explicit, idempotent assertion keeps site.yml self-healing. Set false to rely
 # solely on the wg-quick hooks.
 dromos_routing_assert: true
+# Phebes runtime-state self-heal timer. dromos-assert-runtime reasserts the
+# fwmark policy rules, the custom routing tables, and the geobase ipset -- the
+# kernel runtime state that can drift away on a converged host without WG
+# restarting. The timer runs it shortly after boot and then on a light interval.
+# The script is idempotent and only adds missing Dromos-owned state.
+dromos_routing_assert_timer_enabled: true
+dromos_assert_runtime_boot_sec: 30s
+dromos_assert_runtime_interval: 1min
 dromos_client_mtu: 1380
 # DNS handed to WireGuard clients. Phebes does NOT run a resolver, so pointing
 # clients at the tunnel gateway (10.66.0.1) made every lookup fail. Use public

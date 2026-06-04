@@ -1,0 +1,222 @@
+#!/bin/bash
+# dromos-assert-runtime -- reassert Dromos *runtime* (kernel) state on Phebes.
+#
+# Dromos owns two kinds of state. Persistent state (systemd units, nft ruleset
+# file, rendered configs) survives reboots because Ansible writes it to disk.
+# *Runtime* state lives only in the kernel and is re-created by helper commands:
+#
+#   - the fwmark 0x42/0x43 -> table 100/101 `ip rule` entries
+#   - the default routes inside tables 100 (RU direct) and 101 (foreign/Peleon)
+#   - the geobase ipset (nft set inet dromos dromos_ru4)
+#
+# Those re-creating commands normally run from wg-quick PostUp hooks -- but only
+# when an interface actually (re)starts. On a converged host whose WG units stay
+# up across a network event, table teardown, or partial restart, the policy
+# rules and routes can silently drift away while WireGuard itself stays healthy.
+# Symptom seen live: `ip rule show` lost the Dromos fwmark rules, healthcheck
+# went red, and `dromos-routing apply client` immediately restored it.
+#
+# This script is the periodic self-heal for that gap. A systemd timer
+# (dromos-routing-assert.timer) runs it at boot and every minute. It is
+# idempotent, conservative, and SSH-safe:
+#
+#   * It only ADDS missing Dromos-owned state. It never flushes the firewall,
+#     never touches the host default route or any non-Dromos ip rule, and never
+#     restarts WireGuard. The underlying `dromos-routing apply` and
+#     `dromos-geo-update` are themselves idempotent.
+#   * It acts only when the relevant interface already exists, so a host that is
+#     mid-bringup (or is not actually Phebes) is left alone.
+#   * It is verbose to stdout/stderr so `journalctl -u dromos-routing-assert`
+#     shows exactly what was checked and what (if anything) was repaired.
+#
+# Exit status: 0 when the runtime state is present (or was successfully
+# repaired); nonzero only if a repair was attempted and the state is still
+# missing afterwards, so a failing timer run is visible in `systemctl status`.
+set -uo pipefail
+
+# Source the Ansible-rendered runtime env (DROMOS_ROLE, DROMOS_EGRESS_IF, the
+# mark/table overrides) without clobbering anything already in the environment.
+DROMOS_ROUTING_ENV=${DROMOS_ROUTING_ENV:-/etc/dromos/routing.env}
+# shellcheck source=/dev/null
+[ -r "$DROMOS_ROUTING_ENV" ] && . "$DROMOS_ROUTING_ENV"
+
+ROLE=${DROMOS_ROLE:-}
+CLIENT_IF=${DROMOS_CLIENT_IF:-dromos-client}
+BACKBONE_IF=${DROMOS_BACKBONE_IF:-dromos-backbone}
+NFT_TABLE=${DROMOS_NFT_TABLE:-dromos}
+RU_SET=${DROMOS_RU_SET:-dromos_ru4}
+MARK_RU=${DROMOS_MARK_RU:-0x42}
+MARK_FOREIGN=${DROMOS_MARK_FOREIGN:-0x43}
+TABLE_RU=${DROMOS_TABLE_RU:-100}
+TABLE_FOREIGN=${DROMOS_TABLE_FOREIGN:-101}
+CACHE_DIR=${DROMOS_CACHE_DIR:-/var/cache/dromos}
+RT_TABLES=${DROMOS_RT_TABLES:-/etc/iproute2/rt_tables}
+
+DROMOS_ROUTING=${DROMOS_ROUTING:-/usr/local/sbin/dromos-routing}
+DROMOS_GEO_UPDATE=${DROMOS_GEO_UPDATE:-/usr/local/sbin/dromos-geo-update}
+NFT=${NFT:-nft}
+
+log() { printf '[dromos-assert-runtime] %s\n' "$*"; }
+
+# Resolve a table id to its rt_tables alias (e.g. 100 -> dromos_ru), or empty.
+# `ip rule show` prints the alias once dromos-routing has installed it, so the
+# idempotency check below must accept either the numeric id or the alias.
+rt_table_name() {
+    local id="$1"
+    awk -v id="$id" '
+        /^[[:space:]]*#/ {next}
+        $1 == id {print $2; found=1; exit}
+        END {if(!found) exit 1}
+    ' "$RT_TABLES" 2>/dev/null
+}
+
+# True if an `ip rule` matching the given fwmark routes to the given table,
+# whether iproute2 printed the table as its numeric id or its rt_tables alias.
+ip_rule_has_fwmark() {
+    local mark="$1" table_id="$2" name mark_norm table_pat
+    mark_norm=$(printf '%#x' "$mark" 2>/dev/null || echo "$mark")
+    name=$(rt_table_name "$table_id" || true)
+    table_pat="$table_id"
+    [ -n "$name" ] && table_pat="(${table_id}|${name})"
+    ip rule show 2>/dev/null \
+        | grep -Eiq "fwmark (${mark}|${mark_norm})\b.*lookup ${table_pat}\b"
+}
+
+# Count IPv4 CIDRs currently in the geobase nft set.
+ru_set_count() {
+    $NFT list set inet "$NFT_TABLE" "$RU_SET" 2>/dev/null \
+        | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' || true
+}
+
+fails=0
+
+# Auto-detect role when the env file did not set it: Phebes is the only host
+# with a dromos-client interface. A host that is neither is left untouched.
+if [ -z "$ROLE" ]; then
+    if ip link show "$CLIENT_IF" >/dev/null 2>&1; then
+        ROLE=phebes
+    else
+        ROLE=peleon
+    fi
+fi
+
+if [ "$ROLE" != "phebes" ]; then
+    log "role is '$ROLE', not phebes; nothing to assert (this unit is Phebes-only)"
+    exit 0
+fi
+
+log "asserting Phebes runtime state (role=$ROLE)"
+
+# --- 1. nft table present -> start dromos-nft if it has drifted away ---------
+# We never reload the ruleset blindly (that would reset the firewall); we only
+# (re)activate the oneshot unit when the table is actually gone. nft -f from the
+# unit re-adds the table without disturbing other tables.
+if $NFT list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    log "nft table inet $NFT_TABLE present"
+else
+    log "nft table inet $NFT_TABLE MISSING; starting dromos-nft.service"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl start dromos-nft.service || log "WARN: dromos-nft.service start failed"
+    fi
+    if $NFT list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        log "nft table inet $NFT_TABLE restored"
+    else
+        log "FAIL: nft table inet $NFT_TABLE still missing after start"
+        fails=$((fails + 1))
+    fi
+fi
+
+# --- 2. geobase ipset populated ---------------------------------------------
+# Repopulate only when nearly empty. Prefer the cached CIDR list (cheap, offline)
+# and fall back to a full geo update only when no cache exists. dromos-geo-update
+# never empties a healthy set, so calling it here is safe.
+ru_count=$(ru_set_count)
+ru_count=${ru_count:-0}
+if [ "$ru_count" -gt 100 ]; then
+    log "geobase ipset $RU_SET populated ($ru_count entries)"
+elif $NFT list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    cache="$CACHE_DIR/ipset-ru4.cache"
+    if [ -r "$cache" ] && [ -s "$cache" ]; then
+        log "geobase ipset $RU_SET low ($ru_count); reloading from cache $cache"
+        batch=$(mktemp)
+        {
+            echo "flush set inet ${NFT_TABLE} ${RU_SET}"
+            printf 'add element inet %s %s { %s }\n' \
+                "$NFT_TABLE" "$RU_SET" "$(paste -sd, "$cache")"
+        } > "$batch"
+        $NFT -f "$batch" || log "WARN: nft reload from cache failed"
+        rm -f "$batch"
+    elif [ -x "$DROMOS_GEO_UPDATE" ]; then
+        log "geobase ipset $RU_SET low ($ru_count) and no cache; running dromos-geo-update"
+        "$DROMOS_GEO_UPDATE" || log "WARN: dromos-geo-update failed (keeping existing set)"
+    else
+        log "WARN: geobase low ($ru_count) but no cache and no $DROMOS_GEO_UPDATE"
+    fi
+    ru_count=$(ru_set_count); ru_count=${ru_count:-0}
+    if [ "$ru_count" -gt 100 ]; then
+        log "geobase ipset $RU_SET now populated ($ru_count entries)"
+    else
+        log "FAIL: geobase ipset $RU_SET still low ($ru_count entries)"
+        fails=$((fails + 1))
+    fi
+else
+    log "skipping geobase check; nft table absent"
+fi
+
+# --- 3. policy routing: fwmark rules + per-table routes ----------------------
+# `dromos-routing apply client` re-adds the fwmark rules and refills tables 100
+# and 101. It is idempotent (adds only what is missing) and touches only
+# Dromos-owned rules/tables. Run it whenever a rule has drifted, gated on the
+# client interface existing so we don't act on a non-Phebes / mid-bringup host.
+if ip link show "$CLIENT_IF" >/dev/null 2>&1; then
+    if ip_rule_has_fwmark "$MARK_RU" "$TABLE_RU" \
+       && ip_rule_has_fwmark "$MARK_FOREIGN" "$TABLE_FOREIGN"; then
+        log "fwmark policy rules present ($MARK_RU->$TABLE_RU, $MARK_FOREIGN->$TABLE_FOREIGN)"
+    else
+        log "fwmark policy rules MISSING; running 'dromos-routing apply client'"
+        if [ -x "$DROMOS_ROUTING" ]; then
+            "$DROMOS_ROUTING" apply client || log "WARN: dromos-routing apply client failed"
+        else
+            log "WARN: $DROMOS_ROUTING not executable"
+        fi
+        if ip_rule_has_fwmark "$MARK_RU" "$TABLE_RU" \
+           && ip_rule_has_fwmark "$MARK_FOREIGN" "$TABLE_FOREIGN"; then
+            log "fwmark policy rules restored"
+        else
+            log "FAIL: fwmark policy rules still missing after apply"
+            fails=$((fails + 1))
+        fi
+    fi
+else
+    log "skipping client policy routing; $CLIENT_IF absent"
+fi
+
+# --- 4. backbone (foreign) table -------------------------------------------
+# Table 101 routes foreign traffic out the backbone to Peleon. Refill it only
+# when the backbone interface exists and the table has no default route.
+if ip link show "$BACKBONE_IF" >/dev/null 2>&1; then
+    if ip route show table "$TABLE_FOREIGN" 2>/dev/null | grep -q '^default'; then
+        log "backbone table $TABLE_FOREIGN has its default route"
+    else
+        log "backbone table $TABLE_FOREIGN missing default; running 'dromos-routing apply backbone'"
+        if [ -x "$DROMOS_ROUTING" ]; then
+            "$DROMOS_ROUTING" apply backbone || log "WARN: dromos-routing apply backbone failed"
+        else
+            log "WARN: $DROMOS_ROUTING not executable"
+        fi
+        if ip route show table "$TABLE_FOREIGN" 2>/dev/null | grep -q '^default'; then
+            log "backbone table $TABLE_FOREIGN default route restored"
+        else
+            log "WARN: backbone table $TABLE_FOREIGN still has no default route"
+        fi
+    fi
+else
+    log "skipping backbone table; $BACKBONE_IF absent"
+fi
+
+if [ "$fails" -gt 0 ]; then
+    log "done with $fails unrepaired item(s)"
+    exit 1
+fi
+log "runtime state OK"
+exit 0

@@ -19,7 +19,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y wireguard-tools shellcheck
       - name: Lint shell scripts
-        run: shellcheck scripts/dromos-routing scripts/dromos-geo-update scripts/dromos-healthcheck scripts/dromos-diagnose scripts/dromos-backup scripts/dromos-restore || true
+        run: shellcheck scripts/dromos-routing scripts/dromos-geo-update scripts/dromos-healthcheck scripts/dromos-diagnose scripts/dromos-assert-runtime scripts/dromos-backup scripts/dromos-restore || true
       - name: Run unit tests
         run: pytest -v tests/unit/
 
