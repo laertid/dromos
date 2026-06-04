@@ -138,6 +138,57 @@ when green (warnings allowed), 1 on any FAIL. See
 [docs/troubleshooting.md](troubleshooting.md#start-here-dromos-diagnose-whole-path-check-from-your-workstation)
 for how to read the output, and `scripts/dromos-diagnose --help` for flags.
 
+### Runtime-state self-heal (Phebes)
+
+Dromos owns two kinds of state, and the difference matters when diagnosing
+intermittent Phebes failures:
+
+- **Persistent state** lives on disk and survives reboots because Ansible writes
+  it: the systemd units, the rendered `nft` ruleset file, the WireGuard configs.
+- **Runtime state** lives only in the kernel and has to be *re-created* by helper
+  commands after boot or after the relevant interface comes up:
+  - the `ip rule` fwmark entries (`0x42` → table `100`, `0x43` → table `101`),
+  - the default routes inside tables `100` (RU-direct) and `101` (foreign/Peleon),
+  - the geobase set `nft … set inet dromos dromos_ru4`.
+
+Those re-creating commands (`dromos-routing apply …`, `dromos-geo-update`) run
+from the WireGuard `wg-quick` PostUp hooks — but **only when an interface
+actually (re)starts**. On a converged host whose WG units stay up across a
+network event, a routing-table teardown, or a partial restart, the policy rules
+and routes can silently drift away *while WireGuard itself stays healthy*. The
+symptom is a `dromos-diagnose` run that shows a healthy WireGuard backbone but
+`[FAIL]` lines for the missing fwmark rules (and sometimes the `nft`/ipset
+checks), with a manual `sudo /usr/local/sbin/dromos-routing apply client`
+instantly restoring health.
+
+To close that gap, Phebes runs a periodic self-heal:
+
+- **`/usr/local/sbin/dromos-assert-runtime`** — an idempotent script that checks
+  each piece of runtime state and repairs only what is missing: starts
+  `dromos-nft.service` if the table is gone, reloads the geobase from its cache
+  (or runs a geo update if there is no cache), and runs
+  `dromos-routing apply client` / `apply backbone` when the fwmark rules or the
+  table-101 default route have drifted. It **never** resets the firewall,
+  touches the host default route, or restarts WireGuard, so it is safe to run on
+  a live host carrying your SSH session.
+- **`dromos-routing-assert.timer`** runs it shortly after boot
+  (`OnBootSec`, default `30s`) and then on a light interval
+  (`OnUnitActiveSec`, default `1min`). Tune via
+  `dromos_assert_runtime_boot_sec` / `dromos_assert_runtime_interval`, or disable
+  with `dromos_routing_assert_timer_enabled: false`.
+
+Inspect it with:
+
+```bash
+systemctl status dromos-routing-assert.timer
+journalctl -u dromos-routing-assert.service --since '1 hour ago'
+sudo /usr/local/sbin/dromos-assert-runtime   # run it on demand
+```
+
+This complements (does not replace) the `site.yml` converge-time assertion: the
+playbook reasserts routing on every run, and the timer keeps it asserted between
+runs.
+
 ## Logs
 
 | What                | Where                                    |

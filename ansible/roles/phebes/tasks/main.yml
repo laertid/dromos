@@ -290,3 +290,62 @@
     enabled: true
     state: started
     daemon_reload: true
+
+# --- Phebes runtime-state self-heal ----------------------------------------
+# Dromos policy rules, custom routing tables, and the geobase ipset are *kernel*
+# runtime state, not persistent config. They are normally re-created by wg-quick
+# PostUp hooks -- but only when an interface actually (re)starts. On a converged
+# host whose WG units stay up across a network event or partial teardown, the
+# fwmark rules/routes can silently drift away while WireGuard stays healthy
+# (observed live: `ip rule show` lost the Dromos rules, healthcheck red, fixed
+# by a manual `dromos-routing apply client`). A periodic timer reasserts that
+# runtime state. The script is idempotent and only ADDS missing Dromos-owned
+# state -- it never resets the firewall, the default route, or restarts WG.
+- name: Install dromos-assert-runtime self-heal script
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../scripts/dromos-assert-runtime"
+    dest: /usr/local/sbin/dromos-assert-runtime
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install dromos-routing-assert service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/dromos-routing-assert.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Reassert Dromos runtime policy-routing/ipset state (Phebes)
+      After=network-online.target dromos-nft.service
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/dromos-assert-runtime
+  notify: reload systemd
+
+- name: Install dromos-routing-assert timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/dromos-routing-assert.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Periodically reassert Dromos runtime state (Phebes)
+      [Timer]
+      OnBootSec={{ dromos_assert_runtime_boot_sec | default('30s') }}
+      OnUnitActiveSec={{ dromos_assert_runtime_interval | default('1min') }}
+      AccuracySec=15s
+      Persistent=true
+      [Install]
+      WantedBy=timers.target
+  notify: reload systemd
+
+- name: Enable Dromos runtime-assert timer
+  ansible.builtin.systemd:
+    name: dromos-routing-assert.timer
+    enabled: "{{ dromos_routing_assert_timer_enabled | default(true) | bool }}"
+    state: "{{ 'started' if (dromos_routing_assert_timer_enabled | default(true) | bool) else 'stopped' }}"
+    daemon_reload: true

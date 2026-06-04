@@ -289,14 +289,39 @@ and re-running the Phebes playbook. **Existing users must regenerate or
 hand-edit their configs** afterward (`dromos-user show <name>` prints the
 updated config); a client holding an old config keeps the old DNS line.
 
-## "ip rule" entries vanished
+## "ip rule" entries vanished (fwmark rules missing, WireGuard still healthy)
 
-A reboot without the systemd unit, or someone ran `ip rule flush`.
+**Symptom:** `dromos-diagnose` (or `dromos-healthcheck` on Phebes) reports
+`[FAIL] ip rule fwmark 0x42 -> 100 missing` and/or `0x43 -> 101 missing` — and
+sometimes the `nft`/ipset checks too — while the WireGuard backbone is perfectly
+healthy (recent handshake, ping OK). This is **runtime-state drift**: the policy
+rules, the custom routing tables, and the geobase set are kernel state that is
+re-created by the `wg-quick` PostUp hooks *only when an interface restarts*. On a
+converged host they can disappear after a network event or a routing teardown
+without WireGuard restarting. See
+[operations.md → Runtime-state self-heal](operations.md#runtime-state-self-heal-phebes)
+for the full explanation.
+
+**Immediate fix (idempotent, SSH-safe — only adds Dromos-owned state):**
 
 ```bash
-systemctl restart dromos-routing.service
-# this re-applies all ip rule / ip route commands from /etc/dromos/routing.conf
+sudo /usr/local/sbin/dromos-assert-runtime          # checks + repairs everything
+# or, more narrowly:
+sudo /usr/local/sbin/dromos-routing apply client     # fwmark rules + tables 100/101
+sudo /usr/local/sbin/dromos-routing apply backbone   # table 101 default route
 ```
+
+**Keep it from recurring:** Phebes ships a `dromos-routing-assert.timer` that
+runs `dromos-assert-runtime` at boot and every minute to reassert this state
+automatically. Confirm it is enabled:
+
+```bash
+systemctl status dromos-routing-assert.timer
+journalctl -u dromos-routing-assert.service --since '30 min ago'
+```
+
+If the timer is missing or disabled, re-run the Phebes playbook (it installs and
+enables it), or set `dromos_routing_assert_timer_enabled: true` in inventory.
 
 ## "I locked myself out of SSH after running site.yml" (port 22 open, banner hangs)
 

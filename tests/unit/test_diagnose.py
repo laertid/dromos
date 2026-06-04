@@ -83,6 +83,7 @@ if [[ "$cmd" == *list-unit-files* ]]; then emit "$cmd"; exit 0; fi
 # stub mirrors those tokens so the script's case-handling is exercised.
 if [[ "$cmd" == *routing.env* ]]; then
   if [[ "${EGRESS_NOENV:-0}" == "1" ]]; then emit "egress-noenv"; exit 0; fi
+  if [[ "${EGRESS_NOPERM:-0}" == "1" ]]; then emit "egress-noperm"; exit 0; fi
   if [[ "${EGRESS_UNSET:-0}" == "1" ]]; then emit "egress-unset"; exit 0; fi
   emit "egress-ok:${EGRESS_IF:-enx5}"; exit 0
 fi
@@ -333,7 +334,19 @@ def test_empty_capture_fails_when_wireguard_also_unhealthy(tmp_path):
 def test_egress_noenv_warns_not_fail(tmp_path):
     res = _run(tmp_path, EGRESS_NOENV="1", PELEON_TCPDUMP="1",
                UFW_ACTIVE="1", UFW_ROUTE_ALLOW="1")
-    assert "routing.env unreadable" in res.stdout, res.stdout
+    assert "routing.env not found" in res.stdout, res.stdout
+    assert "[FAIL]" not in res.stdout, res.stdout
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_egress_noperm_warns_not_fail(tmp_path):
+    # /etc/dromos is 0750 root:root, so a non-root SSH user without sudo cannot
+    # traverse into it. That must surface as a distinct "not readable" warning,
+    # not the old spurious "unreadable" verdict and never a FAIL on a host whose
+    # routing.env actually exists and is correct.
+    res = _run(tmp_path, EGRESS_NOPERM="1", PELEON_TCPDUMP="1",
+               UFW_ACTIVE="1", UFW_ROUTE_ALLOW="1")
+    assert "present but not readable" in res.stdout, res.stdout
     assert "[FAIL]" not in res.stdout, res.stdout
     assert res.returncode == 0, res.stdout + res.stderr
 
@@ -350,6 +363,113 @@ def test_egress_ok_reports_interface(tmp_path):
     res = _run(tmp_path, EGRESS_IF="eth0", PELEON_TCPDUMP="1",
                UFW_ACTIVE="1", UFW_ROUTE_ALLOW="1")
     assert "egress interface eth0 present" in res.stdout, res.stdout
+
+
+# --- EGRESS_PROBE shell logic (real snippet, not the stubbed token) --------
+# The stub above feeds canned egress-* tokens to exercise the script's case
+# dispatch. These tests instead run the *actual* EGRESS_PROBE snippet extracted
+# from the script against real files and fake `ip`/`sudo` binaries, so the file
+# read + sed parsing + classification logic itself is covered. This is what
+# regressed live: /etc/dromos being 0750 made `[ -r .../routing.env ]` false for
+# a non-root user, so the old probe emitted egress-noenv ("unreadable") even
+# though the file was a perfectly good 0644.
+
+def _extract_egress_probe() -> str:
+    text = SCRIPT.read_text()
+    for line in text.splitlines():
+        if line.startswith("EGRESS_PROBE="):
+            val = line[len("EGRESS_PROBE="):].strip()
+            # The value is wrapped in single quotes in the script source.
+            assert val.startswith("'") and val.endswith("'"), val
+            return val[1:-1]
+    raise AssertionError("EGRESS_PROBE assignment not found in dromos-diagnose")
+
+
+def _run_probe(tmp_path: Path, *, env_body=None, fake_sudo="passthrough",
+               ifaces=("eth0",)):
+    """Run the real EGRESS_PROBE with controlled fakes. Returns its stdout token.
+
+    env_body: contents of the routing.env file, or None to not create it.
+    fake_sudo: 'passthrough' (sudo runs the command), 'deny' (sudo -n fails like
+               a user without NOPASSWD), or 'absent' (no sudo on PATH at all).
+    ifaces: interface names that the fake `ip link show NAME` reports as present.
+    """
+    etc = tmp_path / "etc-dromos"
+    etc.mkdir()
+    envfile = etc / "routing.env"
+    if env_body is not None:
+        envfile.write_text(env_body)
+
+    bind = tmp_path / "probe-bin"
+    bind.mkdir()
+    # fake `ip`: succeed only for known interfaces under `ip link show NAME`.
+    known = " ".join(ifaces)
+    _write_stub(bind, "ip", f"""#!/bin/bash
+if [[ "$1" == "link" && "$2" == "show" ]]; then
+  for k in {known}; do [[ "$3" == "$k" ]] && exit 0; done
+  exit 1
+fi
+exit 0
+""")
+    if fake_sudo == "passthrough":
+        _write_stub(bind, "sudo", '#!/bin/bash\n[[ "$1" == "-n" ]] && shift\nexec "$@"\n')
+    elif fake_sudo == "deny":
+        _write_stub(bind, "sudo", '#!/bin/bash\nexit 1\n')
+    # 'absent' -> no sudo written; PATH below still has the system one, so blank it.
+
+    probe = _extract_egress_probe().replace("/etc/dromos/routing.env", str(envfile))
+    env = dict(os.environ)
+    if fake_sudo == "absent":
+        env["PATH"] = str(bind)   # isolate: no system sudo, only our fakes
+    else:
+        env["PATH"] = f"{bind}:{env['PATH']}"
+    res = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, env=env)
+    return res.stdout.strip()
+
+
+def test_probe_reads_root_only_file_via_sudo(tmp_path):
+    # File exists and names a present interface; sudo can read it. Expect ok.
+    token = _run_probe(
+        tmp_path,
+        env_body="DROMOS_ROLE=phebes\nDROMOS_EGRESS_IF=eth0\n",
+        fake_sudo="passthrough", ifaces=("eth0",),
+    )
+    assert token == "egress-ok:eth0", token
+
+
+def test_probe_missing_file_is_noenv(tmp_path):
+    token = _run_probe(tmp_path, env_body=None, fake_sudo="passthrough")
+    assert token == "egress-noenv", token
+
+
+def test_probe_reads_via_plain_cat_when_sudo_denied(tmp_path):
+    # sudo -n fails (no NOPASSWD) but the file is readable by the SSH user: the
+    # plain `cat` fallback must still succeed and classify ok. This is the common
+    # case where the operator SSHes in as a user who can read a 0644 file.
+    token = _run_probe(
+        tmp_path,
+        env_body="DROMOS_EGRESS_IF=eth0\n",
+        fake_sudo="deny", ifaces=("eth0",),
+    )
+    assert token == "egress-ok:eth0", token
+
+
+def test_probe_missing_iface_is_egress_missing(tmp_path):
+    token = _run_probe(
+        tmp_path,
+        env_body="DROMOS_EGRESS_IF=enx9\n",
+        fake_sudo="passthrough", ifaces=("eth0",),
+    )
+    assert token == "egress-missing:enx9", token
+
+
+def test_probe_no_assignment_is_unset(tmp_path):
+    token = _run_probe(
+        tmp_path,
+        env_body="DROMOS_ROLE=phebes\n# no egress line\n",
+        fake_sudo="passthrough",
+    )
+    assert token == "egress-unset", token
 
 
 # --- safety: never prints secrets ------------------------------------------
