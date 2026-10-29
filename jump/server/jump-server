@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""jump-server: manage the Dromos "jump" WireGuard hub.
+
+The jump hub lets a machine without a public IP (A) send all of its internet
+traffic out through another machine without a public IP (B), using a server
+with a public IP (S) as the meeting point:
+
+    A (laptop/router) --wg--> S (this host) --wg--> B (laptop/router) --NAT--> internet
+
+Everything lives on one WireGuard interface (`dromos-jump`). WireGuard's
+cryptokey routing picks the peer by the most specific AllowedIPs match: clients
+own a /32 each, the single exit peer owns 0.0.0.0/0 ("everything else").
+Forwarded client traffic is steered back into the interface by a policy rule
+installed by `jump-forward` (see PostUp/PreDown in the rendered config).
+
+State of truth: $JUMP_CONFIG_DIR/jump.json (default /etc/dromos/jump/jump.json)
+Secrets:        $JUMP_SECRETS_DIR (default /etc/dromos/secrets/jump)
+Server config:  $JUMP_WG_CONF (default /etc/wireguard/dromos-jump.conf)
+
+Idempotent. Peer changes are applied with `wg syncconf`, so the interface is
+not bounced and existing tunnels stay up.
+"""
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("JUMP_CONFIG_DIR", "/etc/dromos/jump"))
+SECRETS_DIR = Path(os.environ.get("JUMP_SECRETS_DIR", "/etc/dromos/secrets/jump"))
+WG_CONF = Path(os.environ.get("JUMP_WG_CONF", "/etc/wireguard/dromos-jump.conf"))
+FORWARD_BIN = os.environ.get("JUMP_FORWARD_BIN", "/usr/local/sbin/jump-forward")
+# Set JUMP_NO_APPLY=1 to only write files (tests, dry runs).
+NO_APPLY = os.environ.get("JUMP_NO_APPLY", "") == "1"
+
+STATE_FILE = CONFIG_DIR / "jump.json"
+ENV_FILE = CONFIG_DIR / "jump.env"
+
+IFNAME = "dromos-jump"
+ROLES = ("client", "exit")
+FIRST_CLIENT_HOST = 10  # .1 = server, .2 = exit, .10+ = clients
+
+DEFAULTS = {
+    "endpoint": None,
+    "port": 51830,
+    # Deliberately disjoint from Dromos (10.66.0.0/24 clients, 10.77.0.0/30
+    # backbone) so jump can share a host with Phebes or Peleon.
+    "subnet": "10.88.0.0/24",
+    "dns": "1.1.1.1, 1.0.0.1",
+    "mtu": 1380,
+    "table": 188,
+    "rule_pref": 1880,
+    "peers": {},
+}
+
+
+# ---------------------------------------------------------------- helpers
+
+def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
+
+
+def _genkey() -> tuple[str, str]:
+    priv = _run(["wg", "genkey"]).stdout.strip()
+    pub = _run(["wg", "pubkey"], input=priv + "\n").stdout.strip()
+    return priv, pub
+
+
+def _write_secret(path: Path, data: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(data)
+    os.replace(tmp, path)
+
+
+def _write_public(path: Path, data: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(data)
+    os.replace(tmp, path)
+
+
+def die(msg: str) -> None:
+    print(f"jump-server: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------- state
+
+def load_state() -> dict:
+    state = json.loads(json.dumps(DEFAULTS))
+    if STATE_FILE.exists():
+        state.update(json.loads(STATE_FILE.read_text()))
+    return state
+
+
+def save_state(state: dict) -> None:
+    _write_public(STATE_FILE, json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def server_keys() -> tuple[str, str]:
+    key, pub = SECRETS_DIR / "server.key", SECRETS_DIR / "server.pub"
+    if not key.exists():
+        priv, public = _genkey()
+        _write_secret(key, priv + "\n")
+        _write_public(pub, public + "\n")
+    return key.read_text().strip(), pub.read_text().strip()
+
+
+def peer_keys(name: str, create: bool = False) -> tuple[str, str]:
+    d = SECRETS_DIR / "peers" / name
+    key, pub = d / "priv", d / "pub"
+    if not key.exists():
+        if not create:
+            die(f"missing keys for peer {name!r} in {d}")
+        priv, public = _genkey()
+        _write_secret(key, priv + "\n")
+        _write_public(pub, public + "\n")
+    return key.read_text().strip(), pub.read_text().strip()
+
+
+def allocate_address(state: dict, role: str) -> str:
+    net = ipaddress.ip_network(state["subnet"])
+    hosts = list(net.hosts())
+    if role == "exit":
+        return str(hosts[1])
+    used = {p["address"] for p in state["peers"].values()}
+    for host in hosts[FIRST_CLIENT_HOST - 1:]:
+        if str(host) not in used:
+            return str(host)
+    die(f"subnet {state['subnet']} is full")
+    raise AssertionError  # unreachable
+
+
+# ---------------------------------------------------------------- rendering
+
+def render_server(state: dict, server_priv: str) -> str:
+    net = ipaddress.ip_network(state["subnet"])
+    server_addr = f"{next(net.hosts())}/{net.prefixlen}"
+    lines = [
+        "# Generated by jump-server. Do not edit; run `jump-server` instead.",
+        "[Interface]",
+        f"Address    = {server_addr}",
+        f"ListenPort = {state['port']}",
+        f"PrivateKey = {server_priv}",
+        "# Routing is owned by jump-forward (policy rule + table), not wg-quick.",
+        "Table      = off",
+        f"PreUp      = sysctl -w net.ipv6.conf.{IFNAME}.disable_ipv6=1 2>/dev/null || true",
+        f"PostUp     = {FORWARD_BIN} up %i",
+        f"PreDown    = {FORWARD_BIN} down %i",
+    ]
+    peers = sorted(state["peers"].items(), key=lambda kv: (kv[1]["role"] != "exit", kv[0]))
+    for name, peer in peers:
+        _, pub = peer_keys(name)
+        allowed = "0.0.0.0/0" if peer["role"] == "exit" else f"{peer['address']}/32"
+        lines += [
+            "",
+            "[Peer]",
+            f"# {name} ({peer['role']})",
+            f"PublicKey  = {pub}",
+            f"AllowedIPs = {allowed}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def render_env(state: dict) -> str:
+    return (
+        "# Generated by jump-server; read by jump-forward.\n"
+        f"JUMP_IF={IFNAME}\n"
+        f"JUMP_SUBNET={state['subnet']}\n"
+        f"JUMP_TABLE={state['table']}\n"
+        f"JUMP_RULE_PREF={state['rule_pref']}\n"
+        f"JUMP_PORT={state['port']}\n"
+    )
+
+
+def render_peer_wg(state: dict, name: str, server_pub: str) -> str:
+    """wg-quick / WireGuard-app config for a laptop (A or B)."""
+    peer = state["peers"][name]
+    priv, _ = peer_keys(name)
+    net = ipaddress.ip_network(state["subnet"])
+    endpoint = f"{state['endpoint']}:{state['port']}"
+    if peer["role"] == "client":
+        return (
+            f"# Dromos jump client {name!r} (machine A). All IPv4 traffic exits via B.\n"
+            "[Interface]\n"
+            f"PrivateKey = {priv}\n"
+            f"Address    = {peer['address']}/32\n"
+            f"DNS        = {state['dns']}\n"
+            f"MTU        = {state['mtu']}\n"
+            "\n[Peer]\n"
+            f"PublicKey  = {server_pub}\n"
+            f"Endpoint   = {endpoint}\n"
+            "AllowedIPs = 0.0.0.0/0\n"
+            "PersistentKeepalive = 25\n"
+        )
+    return (
+        f"# Dromos jump exit {name!r} (machine B). NATs jump clients to the internet.\n"
+        "[Interface]\n"
+        f"PrivateKey = {priv}\n"
+        f"Address    = {peer['address']}/{net.prefixlen}\n"
+        f"MTU        = {state['mtu']}\n"
+        f"PostUp     = /usr/local/sbin/jump-exit-nat up %i {state['subnet']}\n"
+        f"PreDown    = /usr/local/sbin/jump-exit-nat down %i {state['subnet']}\n"
+        "\n[Peer]\n"
+        f"PublicKey  = {server_pub}\n"
+        f"Endpoint   = {endpoint}\n"
+        f"AllowedIPs = {state['subnet']}\n"
+        "PersistentKeepalive = 25\n"
+    )
+
+
+def render_peer_openwrt(state: dict, name: str, server_pub: str) -> str:
+    """Shell env file consumed by router-a/setup.sh or router-b/setup.sh."""
+    peer = state["peers"][name]
+    priv, _ = peer_keys(name)
+    net = ipaddress.ip_network(state["subnet"])
+    prefix = 32 if peer["role"] == "client" else net.prefixlen
+    dns = " ".join(d.strip() for d in state["dns"].split(","))
+    return (
+        f"# Dromos jump OpenWrt env for {name!r}. Contains a private key: keep it secret.\n"
+        f"JUMP_ROLE='{peer['role']}'\n"
+        f"JUMP_PRIVATE_KEY='{priv}'\n"
+        f"JUMP_ADDRESS='{peer['address']}/{prefix}'\n"
+        f"JUMP_SUBNET='{state['subnet']}'\n"
+        f"JUMP_SERVER_PUBLIC_KEY='{server_pub}'\n"
+        f"JUMP_ENDPOINT_HOST='{state['endpoint']}'\n"
+        f"JUMP_ENDPOINT_PORT='{state['port']}'\n"
+        f"JUMP_MTU='{state['mtu']}'\n"
+        f"JUMP_DNS='{dns}'\n"
+    )
+
+
+# ---------------------------------------------------------------- apply
+
+def _iface_up() -> bool:
+    return subprocess.run(["ip", "link", "show", IFNAME], capture_output=True).returncode == 0
+
+
+def write_and_apply(state: dict) -> None:
+    server_priv, _ = server_keys()
+    WG_CONF.parent.mkdir(parents=True, exist_ok=True)
+    _write_secret(WG_CONF, render_server(state, server_priv))
+    _write_public(ENV_FILE, render_env(state))
+    if NO_APPLY:
+        return
+    if _iface_up():
+        stripped = _run(["wg-quick", "strip", str(WG_CONF)]).stdout
+        _run(["wg", "syncconf", IFNAME, "/dev/stdin"], input=stripped)
+    else:
+        _run(["systemctl", "enable", "--now", f"wg-quick@{IFNAME}"])
+
+
+def open_ufw(state: dict) -> None:
+    """Additive-only UFW rules, mirroring the Dromos common role."""
+    if NO_APPLY or not shutil.which("ufw"):
+        return
+    status = subprocess.run(["ufw", "status"], capture_output=True, text=True).stdout
+    if "Status: active" not in status:
+        return
+    ssh_port = os.environ.get("JUMP_SSH_PORT", "22")
+    _run(["ufw", "allow", f"{ssh_port}/tcp", "comment", "dromos: ssh management"])
+    _run(["ufw", "allow", f"{state['port']}/udp", "comment", "dromos-jump: wireguard"])
+    _run(["ufw", "route", "allow", "in", "on", IFNAME, "out", "on", IFNAME,
+          "comment", "dromos-jump: hairpin A<->B"])
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_init(args) -> None:
+    state = load_state()
+    for field in ("endpoint", "port", "subnet", "dns", "mtu"):
+        value = getattr(args, field)
+        if value is not None:
+            state[field] = value
+    if not state["endpoint"]:
+        die("--endpoint is required on first init (public IP or DNS name of this server)")
+    ipaddress.ip_network(state["subnet"])  # validate
+    if args.subnet and state["peers"]:
+        die("cannot change --subnet while peers exist; remove them first")
+    save_state(state)
+    open_ufw(state)
+    write_and_apply(state)
+    _, pub = server_keys()
+    print(f"jump hub ready on {state['endpoint']}:{state['port']}/udp ({state['subnet']})")
+    print(f"server public key: {pub}")
+
+
+def cmd_add(args) -> None:
+    state = load_state()
+    if not state["endpoint"]:
+        die("run `jump-server init --endpoint ...` first")
+    if args.name in state["peers"]:
+        die(f"peer {args.name!r} already exists")
+    if not args.name.replace("-", "").replace("_", "").isalnum():
+        die("peer name must be alphanumeric (dashes/underscores allowed)")
+    if args.role == "exit" and any(p["role"] == "exit" for p in state["peers"].values()):
+        die("an exit peer already exists; only one exit is supported")
+    address = allocate_address(state, args.role)
+    peer_keys(args.name, create=True)
+    state["peers"][args.name] = {"role": args.role, "address": address}
+    save_state(state)
+    write_and_apply(state)
+    print(f"added {args.role} {args.name!r} at {address}")
+    kind = "laptop" if args.role == "client" else "laptop/linux box"
+    print(f"  {kind}: jump-server show {args.name} > {args.name}.conf")
+    print(f"  router: jump-server show {args.name} --format openwrt > {args.name}.env")
+
+
+def cmd_remove(args) -> None:
+    state = load_state()
+    if state["peers"].pop(args.name, None) is None:
+        die(f"no such peer {args.name!r}")
+    save_state(state)
+    write_and_apply(state)
+    shutil.rmtree(SECRETS_DIR / "peers" / args.name, ignore_errors=True)
+    print(f"removed {args.name!r}")
+
+
+def cmd_list(args) -> None:
+    state = load_state()
+    print(f"endpoint {state['endpoint']}:{state['port']}  subnet {state['subnet']}")
+    for name, peer in sorted(state["peers"].items(), key=lambda kv: kv[1]["address"]):
+        print(f"{peer['address']:<15} {peer['role']:<7} {name}")
+
+
+def cmd_show(args) -> None:
+    state = load_state()
+    if args.name not in state["peers"]:
+        die(f"no such peer {args.name!r}")
+    _, server_pub = server_keys()
+    if args.format == "openwrt":
+        text = render_peer_openwrt(state, args.name, server_pub)
+    else:
+        text = render_peer_wg(state, args.name, server_pub)
+    if args.qr:
+        if not shutil.which("qrencode"):
+            die("qrencode is not installed (apt install qrencode)")
+        subprocess.run(["qrencode", "-t", "ansiutf8"], input=text, text=True, check=True)
+    else:
+        sys.stdout.write(text)
+
+
+def cmd_render(args) -> None:
+    state = load_state()
+    priv, _ = server_keys()
+    sys.stdout.write(render_server(state, priv))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="jump-server", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init", help="create or update the hub and bring it up")
+    s.add_argument("--endpoint", help="public IP or DNS name peers connect to")
+    s.add_argument("--port", type=int, help="UDP listen port (default 51830)")
+    s.add_argument("--subnet", help="tunnel subnet (default 10.88.0.0/24)")
+    s.add_argument("--dns", help="DNS for clients (default '1.1.1.1, 1.0.0.1')")
+    s.add_argument("--mtu", type=int, help="peer MTU (default 1380)")
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("add", help="add a peer")
+    s.add_argument("name")
+    s.add_argument("--role", choices=ROLES, required=True,
+                   help="client = machine A (sends traffic), exit = machine B (NATs it out)")
+    s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("remove", help="remove a peer")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_remove)
+
+    s = sub.add_parser("list", help="list peers")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("show", help="print a peer's config")
+    s.add_argument("name")
+    s.add_argument("--format", choices=("wg", "openwrt"), default="wg",
+                   help="wg = WireGuard app / wg-quick file, openwrt = env for router setup.sh")
+    s.add_argument("--qr", action="store_true", help="print as a QR code (mobile apps)")
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("render", help="print the server WireGuard config")
+    s.set_defaults(func=cmd_render)
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    if os.geteuid() != 0 and not NO_APPLY:
+        die("must run as root")
+    try:
+        args.func(args)
+    except subprocess.CalledProcessError as exc:
+        die(f"{' '.join(exc.cmd)} failed: {exc.stderr.strip()}")
+
+
+if __name__ == "__main__":
+    main()

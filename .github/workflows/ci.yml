@@ -20,6 +20,10 @@ jobs:
           sudo apt-get install -y wireguard-tools shellcheck
       - name: Lint shell scripts
         run: shellcheck scripts/dromos-routing scripts/dromos-geo-update scripts/dromos-healthcheck scripts/dromos-diagnose scripts/dromos-assert-runtime scripts/dromos-backup scripts/dromos-restore || true
+      - name: Lint jump scripts
+        run: |
+          shellcheck jump/server/jump-forward jump/server/install.sh jump/laptop-a/install.sh jump/laptop-b/install.sh jump/laptop-b/jump-exit-nat
+          shellcheck -s sh jump/router-a/setup.sh jump/router-b/setup.sh
       - name: Run unit tests
         run: pytest -v tests/unit/
 
