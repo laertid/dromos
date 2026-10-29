@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# jump-forward -- policy routing + forwarding for the Dromos jump hub.
+#
+# Called by wg-quick PostUp/PreDown for dromos-jump:
+#   jump-forward up   <ifname>
+#   jump-forward down <ifname>
+#   jump-forward status <ifname>
+#
+# What it owns (and nothing else):
+#   - ip rule   pref $JUMP_RULE_PREF  iif <ifname> lookup $JUMP_TABLE
+#   - route     default dev <ifname> table $JUMP_TABLE
+#   - iptables  FORWARD -i <ifname> -o <ifname> -j ACCEPT   (Docker/UFW set FORWARD to DROP)
+#   - sysctl    net.ipv4.ip_forward=1, rp_filter=2 (loose) on <ifname>
+#
+# Packets from a client arrive on <ifname>, hit the rule, and are routed back
+# out of <ifname>; WireGuard then hands them to the exit peer (AllowedIPs
+# 0.0.0.0/0). Replies from the exit come back with internet source addresses,
+# which is why rp_filter must be loose on this interface.
+#
+# Idempotent: every add is guarded by a check. Never touches other rules,
+# tables, chains or interfaces, so it is safe next to Dromos (tables 100/101,
+# fwmark 0x42/0x43) and Docker.
+set -euo pipefail
+
+ENV_FILE="${JUMP_ENV_FILE:-/etc/dromos/jump/jump.env}"
+if [[ -r "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+fi
+
+ACTION="${1:-}"
+IF="${2:-${JUMP_IF:-dromos-jump}}"
+TABLE="${JUMP_TABLE:-188}"
+PREF="${JUMP_RULE_PREF:-1880}"
+
+log() { echo "jump-forward: $*" >&2; }
+
+have_iptables() { command -v iptables >/dev/null 2>&1; }
+
+rule_present() {
+    ip -4 rule show pref "$PREF" | grep -q "iif $IF .*lookup $TABLE"
+}
+
+up() {
+    sysctl -qw net.ipv4.ip_forward=1
+    sysctl -qw "net.ipv4.conf.${IF}.rp_filter=2"
+
+    if ! rule_present; then
+        ip -4 rule add pref "$PREF" iif "$IF" lookup "$TABLE"
+    fi
+    ip -4 route replace default dev "$IF" table "$TABLE"
+
+    if have_iptables; then
+        if ! iptables -C FORWARD -i "$IF" -o "$IF" -j ACCEPT 2>/dev/null; then
+            iptables -I FORWARD 1 -i "$IF" -o "$IF" -j ACCEPT
+        fi
+    else
+        log "iptables not found; make sure nothing drops forwarded $IF->$IF traffic"
+    fi
+    log "up: iif $IF -> table $TABLE (pref $PREF)"
+}
+
+down() {
+    while rule_present; do
+        ip -4 rule del pref "$PREF" iif "$IF" lookup "$TABLE" || break
+    done
+    ip -4 route flush table "$TABLE" 2>/dev/null || true
+    if have_iptables; then
+        while iptables -C FORWARD -i "$IF" -o "$IF" -j ACCEPT 2>/dev/null; do
+            iptables -D FORWARD -i "$IF" -o "$IF" -j ACCEPT
+        done
+    fi
+    log "down: removed rule/table $TABLE for $IF"
+}
+
+status() {
+    echo "== rule";     ip -4 rule show pref "$PREF" || true
+    echo "== table $TABLE"; ip -4 route show table "$TABLE" || true
+    echo "== forward";  { have_iptables && iptables -S FORWARD | grep -- "-i $IF" ; } || true
+    echo "== sysctl"
+    sysctl net.ipv4.ip_forward "net.ipv4.conf.${IF}.rp_filter" "net.ipv4.conf.all.rp_filter" 2>/dev/null || true
+    echo "== wg";       wg show "$IF" 2>/dev/null || echo "$IF is down"
+}
+
+case "$ACTION" in
+    up) up ;;
+    down) down ;;
+    status) status ;;
+    *) echo "usage: $0 {up|down|status} [ifname]" >&2; exit 2 ;;
+esac

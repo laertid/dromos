@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# jump-exit-nat -- NAT jump clients out of this machine (machine B).
+#
+# Called by wg-quick PostUp/PreDown in the exit config:
+#   jump-exit-nat up     <ifname> <jump-subnet>
+#   jump-exit-nat down   <ifname> <jump-subnet>
+#   jump-exit-nat status <ifname> <jump-subnet>
+#
+# Owns:
+#   - net.ipv4.ip_forward=1
+#   - FORWARD: drop tunnel -> private/LAN ranges (unless JUMP_ALLOW_LAN=1)
+#   - FORWARD: accept tunnel -> anything else, and established replies back
+#   - nat POSTROUTING: MASQUERADE <jump-subnet> leaving via any non-tunnel iface
+#
+# MASQUERADE is keyed on "not the tunnel" rather than a fixed uplink name, so
+# it keeps working when a laptop switches between Wi-Fi and Ethernet.
+set -euo pipefail
+
+ACTION="${1:-}"
+IF="${2:-dromos-jump}"
+SUBNET="${3:-10.88.0.0/24}"
+COMMENT="dromos-jump-exit"
+PRIVATE_RANGES="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16"
+
+rules() {
+    # One rule per line: <table> <chain> <rule spec...>
+    if [[ "${JUMP_ALLOW_LAN:-0}" != "1" ]]; then
+        echo "filter FORWARD -i $IF -d $PRIVATE_RANGES -j DROP"
+    fi
+    echo "filter FORWARD -i $IF -j ACCEPT"
+    echo "filter FORWARD -o $IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+    echo "nat POSTROUTING -s $SUBNET ! -o $IF -j MASQUERADE"
+}
+
+up() {
+    sysctl -qw net.ipv4.ip_forward=1
+    sysctl -qw "net.ipv6.conf.${IF}.disable_ipv6=1" 2>/dev/null || true
+    # Insert in reverse so the final order matches rules(): DROP before ACCEPT.
+    local lines=()
+    mapfile -t lines < <(rules)
+    local i
+    for ((i = ${#lines[@]} - 1; i >= 0; i--)); do
+        # shellcheck disable=SC2086
+        set -- ${lines[i]}
+        local table="$1" chain="$2"; shift 2
+        if ! iptables -t "$table" -C "$chain" "$@" -m comment --comment "$COMMENT" 2>/dev/null; then
+            iptables -t "$table" -I "$chain" 1 "$@" -m comment --comment "$COMMENT"
+        fi
+    done
+    echo "jump-exit-nat: NAT $SUBNET via $IF enabled" >&2
+}
+
+down() {
+    local line
+    while read -r line; do
+        # shellcheck disable=SC2086
+        set -- $line
+        local table="$1" chain="$2"; shift 2
+        while iptables -t "$table" -C "$chain" "$@" -m comment --comment "$COMMENT" 2>/dev/null; do
+            iptables -t "$table" -D "$chain" "$@" -m comment --comment "$COMMENT"
+        done
+    done < <(rules)
+    echo "jump-exit-nat: NAT $SUBNET via $IF disabled" >&2
+}
+
+status() {
+    iptables -S FORWARD | grep -- "$COMMENT" || true
+    iptables -t nat -S POSTROUTING | grep -- "$COMMENT" || true
+    sysctl net.ipv4.ip_forward
+    wg show "$IF" 2>/dev/null || echo "$IF is down"
+}
+
+case "$ACTION" in
+    up) up ;;
+    down) down ;;
+    status) status ;;
+    *) echo "usage: $0 {up|down|status} <ifname> <jump-subnet>" >&2; exit 2 ;;
+esac

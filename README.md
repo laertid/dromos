@@ -60,6 +60,7 @@ This gives users a Russian IP for Russian services (banking, gov, content geo-lo
 │       ├── phebes/            client-facing WG, geo-routing, SS, OVPN
 │       └── peleon/            backbone WG, exit NAT
 ├── templates/                 Jinja2 templates for WG/SS/OVPN/nftables
+├── jump/                    A→S→B exit tunnel: server hub, laptop/router A and B (see jump/README.md)
 ├── scripts/                   user-add/remove/list, geo-update, backup/restore, healthcheck, diagnose
 └── tests/
     ├── lab/                   Docker-compose lab (client→phebes→peleon→dst)
