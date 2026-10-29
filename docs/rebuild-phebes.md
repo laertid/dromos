@@ -1,134 +1,120 @@
-# Rebuilding Phebes
+# Move or rebuild Phebes without losing users
 
-This runbook recreates Phebes on a new VPS. Expected user-visible downtime: **~10 minutes** (mostly DNS propagation; if you use a short TTL it's closer to 2 min).
+Use this runbook when Phebes moves to a new VPS or hosting provider, or when the
+old VPS is broken and you need a new one. Users keep their current configs. The
+only thing they have to do is turn the tunnel off and on after the DNS change.
 
-## Prerequisites
+Expected downtime: about the DNS TTL plus 1–2 minutes.
 
-- A fresh Ubuntu 22.04 or 24.04 VPS with a Russian IP. Root SSH access.
-- The operator's backup directory (`~/dromos-backup/`) containing the previous Phebes secrets and user list.
-- Peleon is up and reachable. You have not changed Peleon.
-- DNS for your user-facing hostname (`vpn.example.ru`) is under your control with TTL ≤ 300s.
+## What has to move
 
-## Step 0 — pre-flight on your workstation
+Every user credential is stored on Phebes. Peleon stores none.
 
-```bash
-ls ~/dromos-backup/
-# expect: server.key server.pub users.json peleon-peer.conf nftables-cache.nft ipset-ru4.cache
-```
+| Path on Phebes | Why it matters |
+|---|---|
+| `/etc/dromos/secrets/server.key`, `server.pub` | Client-facing WireGuard key. Every client config contains `server.pub`, so a new key would break every client. |
+| `/etc/dromos/secrets/backbone.key`, `backbone.pub` | Backbone key. If you keep it, Peleon's config stays valid. |
+| `/etc/dromos/secrets/clients/` | Per-user configs and keys, used by `dromos-user show`. |
+| `/etc/dromos/users.json` | User names and their VPN IPs. |
+| `/var/cache/dromos/` | RU geobase cache, so routing works before the first download. |
+| `/etc/dromos/jump/` | Only if the jump hub (`jump/`) runs on Phebes. Its keys are already in `secrets/jump/`. |
 
-If any of these are missing, stop and recover them before continuing.
+You do not need `/etc/dromos/client.env` or `routing.env`. Ansible renders them
+from the inventory.
 
-## Step 1 — provision the new VPS
+## 1. Back up the old Phebes
 
-Get the new IP. Add it to inventory:
-
-```bash
-cd dromos
-cp ansible/inventory/sample.ini ansible/inventory/prod.ini
-$EDITOR ansible/inventory/prod.ini
-#   [phebes]
-#   phebes ansible_host=NEW.IP.ADDR ansible_user=root
-#   [peleon]
-#   peleon ansible_host=PELEON.IP   ansible_user=root
-```
-
-Sanity-check connectivity:
+Do this now, and again after every `dromos-user add` or `remove`. Run it on your
+own PC. In these commands `-t` lets `sudo` ask for your password.
 
 ```bash
-ansible -i ansible/inventory/prod.ini phebes -m ping
+OLD=laertid@OLD_PHEBES_IP
+KEY=~/.ssh/joker
+FILES="etc/dromos/secrets etc/dromos/users.json var/cache/dromos"   # add etc/dromos/jump if jump runs here
+
+ssh -t -i $KEY $OLD "sudo sh -c 'umask 077 && tar -C / -czpf /tmp/dromos-backup.tgz $FILES' && sudo chown \$(id -un) /tmp/dromos-backup.tgz"
+scp -i $KEY $OLD:/tmp/dromos-backup.tgz ~/dromos-backup-$(date +%F).tgz
+ssh -i $KEY $OLD 'rm -f /tmp/dromos-backup.tgz'
+chmod 600 ~/dromos-backup-*.tgz
 ```
 
-## Step 2 — install Dromos
+Check the archive with `tar -tzf ~/dromos-backup-YYYY-MM-DD.tgz`. It should list
+`server.key`, `backbone.key`, `users.json` and one directory per user under
+`clients/`.
+
+The archive holds private keys. Store it encrypted, for example
+`age -p` or an encrypted disk, and never commit it.
+
+If the old VPS is already gone, use your latest backup.
+
+## 2. Prepare the new VPS
+
+You need Ubuntu 22.04 or 24.04 with a Russian IP, SSH access for a user with
+sudo, and these inbound ports open in the provider firewall: UDP 51820 for
+clients and TCP 22 for SSH. Phebes connects out to Peleon, so it does not need
+an inbound backbone port.
+
+Restore the archive **before** you run Ansible. The keygen tasks only run when
+the keys are missing, so a restored host keeps the old keys and users.
 
 ```bash
-ansible-playbook -i ansible/inventory/prod.ini ansible/playbooks/phebes.yml
+NEW=laertid@NEW_PHEBES_IP
+scp -i $KEY ~/dromos-backup-YYYY-MM-DD.tgz $NEW:/tmp/dromos-backup.tgz
+ssh -t -i $KEY $NEW 'sudo tar -C / -xzpf /tmp/dromos-backup.tgz && rm -f /tmp/dromos-backup.tgz'
+ssh -t -i $KEY $NEW 'sudo ls -l /etc/dromos/secrets /etc/dromos/users.json'
 ```
 
-This installs WG, nftables, the Dromos systemd units, the geo-update timer, and the SS/OVPN servers. It does **not** start client traffic yet because there are no peers.
-
-## Step 3 — restore secrets and users
+Update the inventory with the new Phebes IP. Keep the same Peleon IP and the
+same Phebes DNS name:
 
 ```bash
-scripts/dromos-restore ~/dromos-backup/
+scripts/dromos-init-inventory --force
 ```
 
-This:
+## 3. Cut over
 
-1. SCPs `server.key`, `server.pub` into `/etc/dromos/secrets/` on Phebes.
-2. Re-creates each user from `users.json` (their existing client public keys are added as WG peers; their existing private keys do NOT leave your laptop, the server only needs the publics).
-3. Adds the existing Peleon peer block from `peleon-peer.conf` so the backbone WG comes up.
-4. Restores the cached `ipset-ru4.cache` so we don't wait for the first geo-update.
-5. Reloads `dromos-client`, `dromos-backbone`, nftables, ip rules.
+Never run two Phebes hosts at the same time. Both would use the same backbone
+key. Peleon would then keep switching its endpoint between them, and foreign
+traffic would break on both.
 
-## Step 4 — verify on the server
-
-```bash
-ssh root@NEW.IP.ADDR
-dromos-healthcheck      # installed by the playbook
-```
-
-Expected output (all `OK`):
-
-```
-[OK]  dromos-client interface up, peers: 3
-[OK]  dromos-backbone handshake age: 12s
-[OK]  ipset dromos_ru4 entries: 312
-[OK]  ip rule fwmark 0x42 → 100 present
-[OK]  ip rule fwmark 0x43 → 101 present
-[OK]  nftables table inet dromos present, 5 chains
-[OK]  ping 10.77.0.2 via dromos-backbone: 14ms
-```
-
-If anything is `FAIL`, see [troubleshooting.md](troubleshooting.md). **Do not change DNS yet.**
-
-## Step 5 — smoke test through the new Phebes
-
-On your laptop, temporarily edit one client config to point `Endpoint` at the new IP. Connect.
-
-```bash
-curl -s https://ifconfig.co/json | jq .country
-# foreign destinations should report "Italy" (exits via Peleon)
-curl -s --resolve yandex.ru:443:87.250.250.242 https://yandex.ru -o /dev/null -w '%{remote_ip}\n'
-# RU destinations should remote_ip = 87.250.250.242 with no Peleon in path
-```
-
-Run `mtr` to one RU host and one non-RU host; the first hop after your tunnel is Phebes in both cases, but the non-RU mtr should show Peleon's IT IP further down.
-
-## Step 6 — flip DNS
-
-```bash
-# in your DNS provider:
-#   vpn.example.ru   A   NEW.IP.ADDR   TTL 60
-```
-
-Users with old Endpoint cached will fail until their client retries (WG retries every ~15s).
-
-## Step 7 — decommission the old VPS
-
-Wait 30 minutes for any stragglers. Then:
-
-```bash
-ssh root@OLD.IP.ADDR systemctl stop dromos-client dromos-backbone
-# verify no live conns
-ssh root@OLD.IP.ADDR wg show dromos-client | grep -c handshake
-```
-
-When count is 0 for a few minutes, terminate the old VPS in your provider's panel.
-
-## Downtime budget
-
-| Step                    | Duration             |
-|-------------------------|----------------------|
-| Provision new VPS       | 2–5 min (provider)   |
-| Playbook                | 2–3 min              |
-| Restore + verify        | 1 min                |
-| DNS propagation @ TTL 60| 1–2 min              |
-| **User-visible total**  | **~10 min**          |
-
-Users mid-stream will see their tunnel drop and reconnect once the DNS flips. WireGuard reconnects in seconds; SS/OVPN may take longer.
+1. Lower the TTL on the Phebes DNS A record to 60 s, ideally a TTL period ahead.
+2. If the old host is still alive, stop it:
+   ```bash
+   ssh -t -i $KEY $OLD 'sudo systemctl disable --now wg-quick@dromos-client wg-quick@dromos-backbone'
+   # if jump runs there too:
+   ssh -t -i $KEY $OLD 'sudo systemctl disable --now wg-quick@dromos-jump'
+   ```
+3. Deploy. Always use `site.yml`, not `phebes.yml`. `phebes.yml` alone fails
+   because it gets Peleon's key from the bootstrap play. Add `-K` if your sudo
+   asks for a password.
+   ```bash
+   ansible-playbook -i ansible/inventory/prod.ini ansible/playbooks/site.yml
+   ```
+4. Check the new host:
+   ```bash
+   scripts/dromos-diagnose -i ansible/inventory/prod.ini
+   ssh -t -i $KEY $NEW 'sudo dromos-user list'     # same users as before
+   ```
+5. Point the DNS A record at the new Phebes IP.
+6. Ask users to turn the tunnel off and on. WireGuard apps resolve the hostname
+   only when the tunnel starts. Then check one RU site and one foreign site.
+   `https://ifconfig.co/ip` should show Peleon's IP.
+7. If jump ran on the old Phebes, reinstall it on the new host with the same
+   endpoint. `install.sh` keeps the restored keys and peers:
+   ```bash
+   cd dromos/jump/server && sudo ./install.sh --endpoint <same endpoint as before>
+   ```
+   If the jump endpoint was an IP instead of a DNS name, every jump peer needs a
+   new config (`jump-server show`).
 
 ## Rollback
 
-If verification fails: do not flip DNS. The old Phebes is still serving. Tear down the new one and try again with the failure captured.
+On the new host, run `sudo systemctl stop wg-quick@dromos-client wg-quick@dromos-backbone`.
+On the old host, run `sudo systemctl start wg-quick@dromos-backbone wg-quick@dromos-client`.
+Then point DNS back to the old IP.
 
-If you already flipped DNS and the new Phebes is broken: flip DNS back. WG clients will pick up the rollback within a TTL.
+## Rebuild from scratch (no backup)
+
+If there is no backup, deploy as a clean install (see README). All users then
+need new configs from `dromos-user add`. Peleon picks up the new backbone key
+automatically on the same `site.yml` run.

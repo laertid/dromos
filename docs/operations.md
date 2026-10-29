@@ -54,26 +54,22 @@ Prints name, allocated IP, last handshake age, bytes rx/tx.
 
 ## Backups
 
-```bash
-# on your operator workstation
-scripts/dromos-backup pull root@phebes.example.ru ~/dromos-backup/
-```
-
-Pulls (over SSH):
-
-- `/etc/dromos/secrets/server.{key,pub}`
-- `/etc/dromos/secrets/clients/*/` (each user's `*.conf` and pub/priv keys)
-- `/etc/dromos/peleon-peer.conf` (the WG peer block for the backbone)
-- `/var/cache/dromos/ipset-ru4.cache`
-- `users.json` (allocation table)
-
-Output is `tar+age`-encrypted with your passphrase. **Do not store the passphrase next to the backup.**
+All user credentials live on Phebes. Peleon stores none. Back up Phebes after
+every `dromos-user add` or `remove`:
 
 ```bash
-scripts/dromos-backup restore root@new-phebes.example.ru ~/dromos-backup/
+ssh -t -i ~/.ssh/joker laertid@PHEBES_IP "sudo sh -c 'umask 077 && tar -C / -czpf /tmp/dromos-backup.tgz etc/dromos/secrets etc/dromos/users.json var/cache/dromos' && sudo chown \$(id -un) /tmp/dromos-backup.tgz"
+scp -i ~/.ssh/joker laertid@PHEBES_IP:/tmp/dromos-backup.tgz ~/dromos-backup-$(date +%F).tgz
+ssh -i ~/.ssh/joker laertid@PHEBES_IP 'rm -f /tmp/dromos-backup.tgz'
 ```
 
-Restores the inverse and reloads services. Used by [rebuild-phebes.md](rebuild-phebes.md).
+The archive contains private keys, so keep it encrypted on your PC.
+
+- Restore, or move Phebes to a new host: [rebuild-phebes.md](rebuild-phebes.md)
+- Move Peleon to a new host (no user data involved): [move-peleon.md](move-peleon.md)
+
+`scripts/dromos-backup` / `dromos-restore` are legacy helpers. They assume
+`root@` or passwordless sudo, so use the commands above.
 
 ## Geobase
 

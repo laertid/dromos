@@ -34,7 +34,7 @@ This gives users a Russian IP for Russian services (banking, gov, content geo-lo
 2. **SSH is sacred.** No playbook flushes nftables, runs `ufw reset`, or otherwise risks locking us out. All firewall changes are additive: into Dromos-owned nftables chains, and — when UFW is the active host firewall — only `ufw allow` rules for the WireGuard ports (and SSH is re-asserted alongside them so opening ports can never sever the session).
 3. **IPv4 only in v1.** IPv6 is disabled on Dromos interfaces to avoid leaks. v2 may add v6 once we have a v6 geobase strategy.
 4. **Idempotent.** Every script and Ansible task can be re-run safely.
-5. **Easy to recreate Phebes.** See [docs/rebuild-phebes.md](docs/rebuild-phebes.md). New VPS, run installer, restore creds, update DNS, ~10 min downtime.
+5. **Easy to recreate Phebes.** See [docs/rebuild-phebes.md](docs/rebuild-phebes.md): back up `/etc/dromos`, restore on the new VPS, run `site.yml`, update DNS. Users keep their configs. Moving Peleon involves no user data, see [docs/move-peleon.md](docs/move-peleon.md).
 6. **No secrets in git.** Generated keys live under `/etc/dromos/secrets/` on the node and in a user-managed backup on the operator's PC.
 
 ## Repository layout
@@ -44,7 +44,8 @@ This gives users a Russian IP for Russian services (banking, gov, content geo-lo
 ├── README.md                  ← this file
 ├── docs/
 │   ├── architecture.md        decisions, diagrams, packet walk
-│   ├── rebuild-phebes.md      runbook for recreating Phebes
+│   ├── rebuild-phebes.md      runbook: move/recreate Phebes, keep users
+│   ├── move-peleon.md         runbook: move Peleon to a new server
 │   ├── operations.md          day-2 ops, user mgmt, backups
 │   ├── troubleshooting.md     diagnosis recipes
 │   └── security.md            threat model, key handling, audit
