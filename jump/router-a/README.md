@@ -4,6 +4,8 @@ An OpenWrt router in city A takes the place of laptop A. Every device behind it 
 
 The stock ASUS firmware also works as A, through its WireGuard client in VPN Fusion: import the `.conf` from `jump-server show a-router` and apply it to all devices. This page covers OpenWrt, which adds the kill switch and DNS handling below.
 
+**Before you start:** if this router is plugged in behind another router that also uses `192.168.1.x`, change its LAN subnet first, with WAN unplugged. See [OpenWrt router behind another router](../README.md#openwrt-router-behind-another-router). The commands below use `192.168.1.1`; replace it with the router's new address.
+
 ## 1. Create the peer on S
 
 ```bash
