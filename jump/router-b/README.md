@@ -29,8 +29,9 @@ ssh root@192.168.1.1 'sh /tmp/setup.sh /tmp/b-exit.env && rm /tmp/b-exit.env'
 | `firewall.jump_zone` | Zone `jump`: input/forward REJECT, output ACCEPT, MSS clamping |
 | `firewall.jump_fwd_wan` | Forwarding `jump → wan`. NAT comes from the stock `wan` zone (`masq 1` is enforced) |
 | `firewall.jump_ssh`, `firewall.jump_ping` | SSH and ping to the router from the tunnel (set `JUMP_ALLOW_SSH=0` to skip) |
+| `firewall.jump_block_private` | Rejects tunnel traffic to `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` and `169.254.0.0/16` via WAN (set `JUMP_ALLOW_LAN=1` to skip) |
 
-Only `10.88.0.0/24` is routed into the tunnel, so the router and its LAN keep using the local ISP as before. There is no `jump → lan` forwarding, so A cannot reach devices in B's home network.
+Only `10.88.0.0/24` is routed into the tunnel, so the router and its LAN keep using the local ISP as before. There is no `jump → lan` forwarding, and `jump_block_private` rejects private addresses behind WAN, so A cannot reach devices in B's home network. That includes the upstream router's network when router B sits behind another router. Set the options before `sh`, for example `JUMP_ALLOW_LAN=1 sh /tmp/setup.sh ...`.
 
 ## 3. Check
 
@@ -38,7 +39,7 @@ On the router:
 
 ```bash
 wg show jump                                   # latest handshake with S
-uclient-fetch -qO- https://ifconfig.me; echo   # B's public IP
+uclient-fetch -qO- https://ifconfig.me/ip; echo   # B's public IP
 ```
 
 On A, `curl -4 ifconfig.me` must print the same address.

@@ -18,7 +18,7 @@ shellcheck jump/server/jump-forward jump/server/install.sh jump/laptop-a/install
 shellcheck -s sh jump/router-a/setup.sh jump/router-b/setup.sh
 ```
 
-CI fails if jump shellcheck reports anything (unlike the Dromos script lint, which ends in `|| true`). CI also has a secret-scan step that rejects `PRIVATE KEY-----`, `wgPrivateKey` and similar strings anywhere outside `docs/` and the workflows. Keep test fixtures and examples free of them.
+CI fails if jump shellcheck reports anything (unlike the Dromos script lint, which ends in `|| true`). CI also has a secret-scan step that greps for private-key markers (see the `secret-scan` job in `ci.yml` for the regex) anywhere outside `docs/` and the workflows. Keep test fixtures, examples and docs free of those literal strings.
 
 ## Architecture
 
@@ -26,7 +26,7 @@ CI fails if jump shellcheck reports anything (unlike the Dromos script lint, whi
 - **`server/jump-forward`** runs as PostUp/PreDown on S. It owns the hairpin: rule pref 1880 `iif dromos-jump lookup 188`, a default route via `dromos-jump` in table 188, a FORWARD accept, and `rp_filter=2`. The server config uses `Table = off`, so the exit peer's `0.0.0.0/0` never reaches the main table. S does no NAT.
 - **Routing relies on WireGuard cryptokey routing.** Each client owns a `/32`, and the single exit peer (always `10.88.0.2`) owns `0.0.0.0/0`. Because of this there can be only one exit per hub, and `add --role exit` rejects a second one.
 - **The OpenWrt env file is a contract.** `render_peer_openwrt()` writes `JUMP_ROLE`, `JUMP_PRIVATE_KEY`, `JUMP_ADDRESS`, `JUMP_SUBNET`, `JUMP_SERVER_PUBLIC_KEY`, `JUMP_ENDPOINT_HOST`/`PORT`, `JUMP_MTU` and `JUMP_DNS` as single-quoted shell assignments. `router-a/setup.sh` and `router-b/setup.sh` source the file and check `JUMP_ROLE`. If you rename or add a variable, update both sides and `test_openwrt_env_is_sourceable`.
-- **Exit NAT happens only on B.** On laptop B it is done by `laptop-b/jump-exit-nat`: iptables rules tagged with the comment `dromos-jump-exit`, inserted at the top of FORWARD, with MASQUERADE written as `! -o dromos-jump` and an RFC1918 DROP unless `JUMP_ALLOW_LAN=1`. On router B it comes from the stock `wan` zone masquerade plus `jump → wan` forwarding.
+- **Exit NAT happens only on B.** On laptop B it is done by `laptop-b/jump-exit-nat`: iptables rules tagged with the comment `dromos-jump-exit`, inserted at the top of FORWARD, with MASQUERADE written as `! -o dromos-jump` and an RFC1918 DROP unless `JUMP_ALLOW_LAN=1`. On router B it comes from the stock `wan` zone masquerade plus `jump → wan` forwarding, with a `jump_block_private` REJECT rule for the same private ranges (skipped with `JUMP_ALLOW_LAN=1`).
 - **Router A** policy-routes only traffic that enters from `lan` (rule 1880, table 188), so the router's own handshake to S goes out over WAN with no loop. It applies a kill switch (`JUMP_KILL_SWITCH`) and disables LAN IPv6 (`JUMP_DISABLE_IPV6`). It records the original settings in `/etc/dromos-jump.state`, so `--remove` can restore them.
 
 ## Constraints when editing
