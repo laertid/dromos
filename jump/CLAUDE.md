@@ -18,7 +18,7 @@ shellcheck jump/server/jump-forward jump/server/install.sh jump/laptop-a/install
 shellcheck -s sh jump/router-a/setup.sh jump/router-b/setup.sh
 ```
 
-CI fails if jump shellcheck reports anything (unlike the Dromos script lint, which ends in `|| true`). CI also has a secret-scan step that rejects `PRIVATE KEY-----`, `wgPrivateKey` and similar strings anywhere outside `docs/` and the workflows. Keep test fixtures and examples free of them.
+CI fails if jump shellcheck reports anything (unlike the Dromos script lint, which ends in `|| true`). CI also has a secret-scan step that greps for private-key markers (see the `secret-scan` job in `ci.yml` for the regex) anywhere outside `docs/` and the workflows. Keep test fixtures, examples and docs free of those literal strings.
 
 ## Architecture
 

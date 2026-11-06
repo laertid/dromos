@@ -23,7 +23,7 @@ scripts/dromos-diagnose -i ansible/inventory/prod.ini                        # r
 
 Run playbooks from the repo root. The root `ansible.cfg` sets `roles_path = ansible/roles`, and `ansible/ansible.cfg` does the same when you run from inside `ansible/`. `prod.ini` is gitignored, so start from `ansible/inventory/sample.ini` or create it with `scripts/dromos-init-inventory`.
 
-CI (`.github/workflows/ci.yml`) runs the unit tests, shellcheck on the jump scripts (failures there fail CI), and a secret scan that rejects strings like `PRIVATE KEY-----` or `wgPrivateKey` anywhere outside `docs/` and the workflows.
+CI (`.github/workflows/ci.yml`) runs the unit tests, shellcheck on the jump scripts (failures there fail CI), and a secret scan that greps for private-key markers (PEM key headers, the WireGuard private-key field name; see the `secret-scan` job for the exact regex) anywhere outside `docs/` and the workflows. Never write those literal strings in code or docs, including in descriptions of the scan itself.
 
 ## Architecture
 
