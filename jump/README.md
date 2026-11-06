@@ -80,6 +80,42 @@ From anywhere else you can reach B through S as a jump host:
 ssh -J user@<S> user@10.88.0.2
 ```
 
+## OpenWrt router behind another router
+
+A fresh OpenWrt router uses `192.168.1.1/24` on LAN. Many home routers use the same `192.168.1.x` network, so a router plugged in behind one ends up with WAN and LAN in the same subnet. Routing then breaks in odd ways: DNS that answers only sometimes, `Operation not permitted` from `wget` or `apk`, and package installs that fail. Before you plug in WAN or run `setup.sh`, move the OpenWrt LAN to a subnet the upstream router doesn't use. For example, use `192.168.117.1` for router B and `192.168.118.1` for router A.
+
+### In LuCI
+
+1. Leave WAN unplugged. Connect a computer by cable to a **LAN** port and open `http://192.168.1.1`. Set a root password if LuCI asks for one.
+2. Go to **Network → Interfaces** and click **Edit** on `lan`.
+3. On **General Settings**, change **IPv4 address** to the new address, for example `192.168.117.1`. Keep the netmask `255.255.255.0`. The DHCP range follows the new subnet automatically.
+4. Click **Save**. Don't click Save & Apply.
+5. Open the drop-down next to **Save & Apply** and choose **Apply unchecked**. Plain Save & Apply waits about 90 seconds for you to confirm from the old address, which you can no longer reach, and then rolls the change back.
+6. Wait about 30 seconds, then unplug and replug the computer's cable, or renew DHCP, so it gets an address in the new subnet. If it doesn't, set a static IP such as `192.168.117.10/24`.
+7. Open `http://192.168.117.1`, then plug in WAN.
+
+### From SSH
+
+Run it as one line, because the session drops when the network restarts:
+
+```sh
+uci set network.lan.ipaddr='192.168.117.1'; uci commit network; /etc/init.d/network restart
+```
+
+### If DNS is still unreliable
+
+If the upstream router hands out a DNS server that doesn't work, or your ISP blocks a public resolver such as `1.1.1.1`, set WAN DNS by hand. In LuCI, go to **Network → Interfaces → wan → Edit → Advanced Settings**, untick **Use DNS servers advertised by peer**, enter `8.8.8.8` and `8.8.4.4`, and click **Save & Apply**. Do the same on `wan6` if it exists. Then check that the router is online:
+
+```sh
+nslookup downloads.openwrt.org && uclient-fetch -qO- https://ifconfig.me/ip; echo
+```
+
+If your ISP blocks `1.1.1.1`, also set the clients' DNS on S (`jump-server init --dns "8.8.8.8, 8.8.4.4"`) and regenerate A's config, because A's DNS queries exit through B.
+
+### Locked out
+
+If you can't reach the router at either address, factory-reset it. Hold Reset for about 10 seconds while it's running, or use failsafe mode: set a static IP `192.168.1.10/24`, press Reset while the power LED blinks fast during boot, then run `ssh root@192.168.1.1` and `firstboot -y && reboot`. This restores default OpenWrt at `192.168.1.1`, not the stock vendor firmware.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -87,6 +123,7 @@ ssh -J user@<S> user@10.88.0.2
 | No handshake on a peer | UDP/51830 blocked at the VPS provider, wrong endpoint, or wrong key | Open the port and re-check with `jump-server show` |
 | A has a handshake but no internet | B is down or has no handshake | Check `wg show` on S. If there is no exit peer, A's traffic is dropped, which is intended |
 | A shows its own ISP IP | IPv6 or DNS going around the tunnel, or a router-A kill switch that is off | See the [laptop-a](laptop-a/README.md) and [router-a](router-a/README.md) notes |
+| Router's DNS answers only sometimes, `wget`/`apk` fail with `Operation not permitted` | OpenWrt LAN and the upstream router's network are both `192.168.1.x` | Move the OpenWrt LAN, see [OpenWrt router behind another router](#openwrt-router-behind-another-router) |
 | Small pages load but big transfers hang | MTU or PMTU problems | Lower the MTU to 1280 with `jump-server init --mtu 1280` and regenerate the peer configs |
 | B works, then stops after a while | The B laptop went to sleep | Disable suspend on B, or use a router as B |
 | A↔B works but S's FORWARD drops traffic | Docker or UFW reset FORWARD | Run `sudo systemctl restart wg-quick@dromos-jump`, which re-runs `jump-forward up` |

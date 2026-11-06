@@ -4,6 +4,8 @@ An OpenWrt router in city B dials out to S and NATs A's traffic out of its WAN, 
 
 The stock firmware on consumer routers, including the ASUS VPN Fusion client, can put the router's own LAN into a tunnel, but it cannot NAT traffic that arrives from the tunnel. That is why the exit role needs OpenWrt.
 
+**Before you start:** if this router is plugged in behind another router that also uses `192.168.1.x`, change its LAN subnet first, with WAN unplugged. See [OpenWrt router behind another router](../README.md#openwrt-router-behind-another-router). The commands below use `192.168.1.1`; replace it with the router's new address.
+
 ## 1. Create the exit peer on S
 
 ```bash
