@@ -85,9 +85,12 @@ ENV="${1:?usage: $0 <client.env> | --remove}"
 KILL_SWITCH="${JUMP_KILL_SWITCH:-1}"
 DISABLE_IPV6="${JUMP_DISABLE_IPV6:-1}"
 
+NETWORK_ACTION=reload
 if ! command -v wg >/dev/null 2>&1 || [ ! -e /lib/netifd/proto/wireguard.sh ]; then
     log "installing WireGuard packages"
     pkg_install wireguard-tools luci-proto-wireguard
+    # netifd only learns a new proto handler when it starts; a reload is not enough.
+    NETWORK_ACTION=restart
 fi
 
 # Record pre-existing DNS/IPv6 settings once, so --remove can restore them.
@@ -173,11 +176,11 @@ for s in $(lan_wan_forwardings); do
 done
 
 uci commit network; uci commit firewall; uci commit dhcp
-/etc/init.d/network reload
+/etc/init.d/network "$NETWORK_ACTION"
 /etc/init.d/firewall restart
 /etc/init.d/dnsmasq restart
 
 sleep 5
 wg show "$IF" || true
 log "LAN now exits via the jump tunnel (kill switch: $KILL_SWITCH)"
-log "check from a LAN device: curl ifconfig.me  -> should print B's public IP"
+log "check from a LAN device: curl -4 ifconfig.me  -> should print B's public IP"

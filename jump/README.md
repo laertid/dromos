@@ -69,7 +69,7 @@ Each machine needs its own peer. Never use one config on two devices at the same
 |---|---|---|
 | S | `sudo wg show dromos-jump` | Every peer shows a recent `latest handshake` |
 | S | `sudo jump-forward status` | Rule pref 1880, `default dev dromos-jump` in table 188, FORWARD accept |
-| B | `curl -4 ifconfig.me` (router: `uclient-fetch -qO- https://ifconfig.me`) | B's public IP, call it `X` |
+| B | `curl -4 ifconfig.me` (router: `uclient-fetch -qO- https://ifconfig.me/ip`) | B's public IP, call it `X` |
 | A | `curl -4 ifconfig.me` | The same `X` |
 | A | `ping 10.88.0.1` and `ping 10.88.0.2` | Both answer |
 | A | `ssh user@10.88.0.2` (router B: `ssh root@10.88.0.2`) | Login to B through the tunnel |

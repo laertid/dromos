@@ -8,8 +8,10 @@
 #   sudo jump-server show b-exit --format openwrt > b-exit.env
 #
 # Traffic arriving from the tunnel is forwarded to WAN only and NATed by the
-# stock wan zone. The tunnel cannot reach this router's LAN. SSH (22/tcp) and
-# ping from the tunnel to the router itself are allowed unless JUMP_ALLOW_SSH=0.
+# stock wan zone. The tunnel cannot reach this router's LAN, and private and
+# link-local destinations behind WAN (the upstream home network, the ISP modem)
+# are rejected unless JUMP_ALLOW_LAN=1. SSH (22/tcp) and ping from the tunnel
+# to the router itself are allowed unless JUMP_ALLOW_SSH=0.
 set -eu
 
 IF=jump
@@ -33,7 +35,8 @@ wan_zone() {
 
 remove() {
     for s in network.$IF network.${IF}_server \
-             firewall.${IF}_zone firewall.${IF}_fwd_wan firewall.${IF}_ssh firewall.${IF}_ping; do
+             firewall.${IF}_zone firewall.${IF}_fwd_wan firewall.${IF}_ssh firewall.${IF}_ping \
+             firewall.${IF}_block_private; do
         uci -q delete "$s" || true
     done
     uci commit network
@@ -53,9 +56,12 @@ ENV="${1:?usage: $0 <exit.env> | --remove}"
 . "$ENV"
 [ "${JUMP_ROLE:-}" = "exit" ] || { echo "$ENV is not an exit env (JUMP_ROLE=${JUMP_ROLE:-unset})" >&2; exit 1; }
 
+NETWORK_ACTION=reload
 if ! command -v wg >/dev/null 2>&1 || [ ! -e /lib/netifd/proto/wireguard.sh ]; then
     log "installing WireGuard packages"
     pkg_install wireguard-tools luci-proto-wireguard
+    # netifd only learns a new proto handler when it starts; a reload is not enough.
+    NETWORK_ACTION=restart
 fi
 
 # ---- network: tunnel interface + server peer
@@ -109,12 +115,28 @@ if [ "${JUMP_ALLOW_SSH:-1}" = "1" ]; then
     uci set firewall.${IF}_ping.target='ACCEPT'
 fi
 
+# Keep A out of private networks reachable through WAN (B's upstream home LAN,
+# the ISP modem). Rules are evaluated before the jump -> wan forwarding.
+uci -q delete firewall.${IF}_block_private || true
+if [ "${JUMP_ALLOW_LAN:-0}" != "1" ]; then
+    uci set firewall.${IF}_block_private=rule
+    uci set firewall.${IF}_block_private.name='Block-private-from-jump'
+    uci set firewall.${IF}_block_private.src="$IF"
+    uci set firewall.${IF}_block_private.dest='wan'
+    uci set firewall.${IF}_block_private.family='ipv4'
+    uci set firewall.${IF}_block_private.proto='all'
+    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16; do
+        uci add_list firewall.${IF}_block_private.dest_ip="$net"
+    done
+    uci set firewall.${IF}_block_private.target='REJECT'
+fi
+
 WAN_ZONE="$(wan_zone)" || { echo "no firewall zone named 'wan'" >&2; exit 1; }
 uci set "firewall.$WAN_ZONE.masq=1"
 
 uci commit network
 uci commit firewall
-/etc/init.d/network reload
+/etc/init.d/network "$NETWORK_ACTION"
 /etc/init.d/firewall restart
 
 DB_IF="$(uci -q get dropbear.@dropbear[0].Interface || true)"
@@ -125,4 +147,4 @@ fi
 
 sleep 5
 wg show "$IF" || true
-log "exit configured at ${JUMP_ADDRESS%/*}; WAN IP: $(uclient-fetch -qO- https://ifconfig.me 2>/dev/null || echo unknown)"
+log "exit configured at ${JUMP_ADDRESS%/*}; WAN IP: $(uclient-fetch -qO- https://ifconfig.me/ip 2>/dev/null || echo unknown)"
